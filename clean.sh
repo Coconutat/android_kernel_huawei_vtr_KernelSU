@@ -5,8 +5,11 @@ echo "开始清理编译残留..."
 start_time_sum=$(date +%s)
 
 rm -rf out
-make clean
-make mrproper
+
+export PATH=$PATH:$(pwd)/../Compiler/gcc-linaro-5.5.0-2017.10-x86_64_aarch64-linux-gnu/bin
+export CROSS_COMPILE=aarch64-linux-gnu-
+
+make ARCH=arm64 distclean
 
 end_time_sum=$(date +%s)
 
