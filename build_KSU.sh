@@ -63,7 +63,9 @@ then
 	echo " "
 	echo "***Sucessfully built P10 version kernel...***"
 	echo " "
+	git reset --hard
 else
 	echo " "
+	git reset --hard
 	echo "***Failed!***"
 fi
