@@ -112,3 +112,14 @@ all.config
 
 # Kdevelop4
 *.kdev4
+
+# Personal 
+out
+drivers/kernelsu
+.vscode
+logs*.txt
+*.zip
+*.gz
+*.img
+kernel_log*.txt
+KernelSU
