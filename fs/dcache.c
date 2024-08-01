@@ -278,8 +278,7 @@ void take_dentry_name_snapshot(struct name_snapshot *name, struct dentry *dentry
 		spin_unlock(&dentry->d_lock);
 		name->name = p->name;
 	} else {
-		memcpy(name->inline_name, dentry->d_iname,
-		       dentry->d_name.len + 1);
+		memcpy(name->inline_name, dentry->d_iname, DNAME_INLINE_LEN);
 		spin_unlock(&dentry->d_lock);
 		name->name = name->inline_name;
 	}
@@ -1632,6 +1631,12 @@ struct dentry *__d_alloc(struct super_block *sb, const struct qstr *name)
 	dentry->d_sb = sb;
 	dentry->d_op = NULL;
 	dentry->d_fsdata = NULL;
+#ifdef CONFIG_HISI_PAGECACHE_DEBUG
+	dentry->mapping_stat.mmap_sync_read_times = 0;
+	dentry->mapping_stat.generic_sync_read_times = 0;
+	dentry->mapping_stat.async_read_times = 0;
+	dentry->mapping_stat.shrink_page_times = 0;
+#endif
 	INIT_HLIST_BL_NODE(&dentry->d_hash);
 	INIT_LIST_HEAD(&dentry->d_lru);
 	INIT_LIST_HEAD(&dentry->d_subdirs);
@@ -3084,6 +3089,7 @@ char *d_absolute_path(const struct path *path,
 		return ERR_PTR(error);
 	return res;
 }
+EXPORT_SYMBOL(d_absolute_path);
 
 /*
  * same as __d_path but appends "(deleted)" for unlinked files.

@@ -28,6 +28,11 @@
 
 #include <trace/events/block.h>
 
+#ifdef CONFIG_HUAWEI_IO_TRACING
+#include <trace/iotrace.h>
+DEFINE_TRACE(block_dm_request);
+#endif
+
 #define DM_MSG_PREFIX "core"
 
 #ifdef CONFIG_PRINTK
@@ -1482,29 +1487,26 @@ static void flush_current_bio_list(struct blk_plug_cb *cb, bool from_schedule)
 	struct dm_offload *o = container_of(cb, struct dm_offload, cb);
 	struct bio_list list;
 	struct bio *bio;
-	int i;
 
 	INIT_LIST_HEAD(&o->cb.list);
 
 	if (unlikely(!current->bio_list))
 		return;
 
-	for (i = 0; i < 2; i++) {
-		list = current->bio_list[i];
-		bio_list_init(&current->bio_list[i]);
+	list = *current->bio_list;
+	bio_list_init(current->bio_list);
 
-		while ((bio = bio_list_pop(&list))) {
-			struct bio_set *bs = bio->bi_pool;
-			if (unlikely(!bs) || bs == fs_bio_set) {
-				bio_list_add(&current->bio_list[i], bio);
-				continue;
-			}
-
-			spin_lock(&bs->rescue_lock);
-			bio_list_add(&bs->rescue_list, bio);
-			queue_work(bs->rescue_workqueue, &bs->rescue_work);
-			spin_unlock(&bs->rescue_lock);
+	while ((bio = bio_list_pop(&list))) {
+		struct bio_set *bs = bio->bi_pool;
+		if (unlikely(!bs) || bs == fs_bio_set) {
+			bio_list_add(current->bio_list, bio);
+			continue;
 		}
+
+		spin_lock(&bs->rescue_lock);
+		bio_list_add(&bs->rescue_list, bio);
+		queue_work(bs->rescue_workqueue, &bs->rescue_work);
+		spin_unlock(&bs->rescue_lock);
 	}
 }
 
@@ -2211,7 +2213,7 @@ static int dm_any_congested(void *congested_data, int bdi_bits)
 			 * the query about congestion status of request_queue
 			 */
 			if (dm_request_based(md))
-				r = md->queue->backing_dev_info.wb.state &
+				r = md->queue->backing_dev_info->wb.state &
 				    bdi_bits;
 			else
 				r = dm_table_any_congested(map, bdi_bits);
@@ -2293,7 +2295,7 @@ static void dm_init_md_queue(struct mapped_device *md)
 	 * - must do so here (in alloc_dev callchain) before queue is used
 	 */
 	md->queue->queuedata = md;
-	md->queue->backing_dev_info.congested_data = md;
+	md->queue->backing_dev_info->congested_data = md;
 }
 
 static void dm_init_old_md_queue(struct mapped_device *md)
@@ -2304,7 +2306,7 @@ static void dm_init_old_md_queue(struct mapped_device *md)
 	/*
 	 * Initialize aspects of queue that aren't relevant for blk-mq
 	 */
-	md->queue->backing_dev_info.congested_fn = dm_any_congested;
+	md->queue->backing_dev_info->congested_fn = dm_any_congested;
 	blk_queue_bounce_limit(md->queue, BLK_BOUNCE_ANY);
 }
 
@@ -2822,6 +2824,11 @@ static unsigned filter_md_type(unsigned type, struct mapped_device *md)
 		return type;
 
 	return !md->use_blk_mq ? DM_TYPE_REQUEST_BASED : DM_TYPE_MQ_REQUEST_BASED;
+}
+
+void dm_setup_md_queue_flush_async(struct mapped_device *md, unsigned char en)
+{
+	blk_flush_reduce(md->queue,en);
 }
 
 /*

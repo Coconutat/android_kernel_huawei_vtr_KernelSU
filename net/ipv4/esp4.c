@@ -615,20 +615,18 @@ static int esp_init_authenc(struct xfrm_state *x)
 
 	if ((x->props.flags & XFRM_STATE_ESN)) {
 		if (snprintf(authenc_name, CRYPTO_MAX_ALG_NAME,
-			     "%s%sauthencesn(%s,%s)%s",
-			     x->geniv ?: "", x->geniv ? "(" : "",
+			     "authencesn(%s,%s)",
 			     x->aalg ? x->aalg->alg_name : "digest_null",
-			     x->ealg->alg_name,
-			     x->geniv ? ")" : "") >= CRYPTO_MAX_ALG_NAME)
-			goto error;
+			     x->ealg->alg_name) >= CRYPTO_MAX_ALG_NAME){
+			     goto error;
+			}
 	} else {
 		if (snprintf(authenc_name, CRYPTO_MAX_ALG_NAME,
-			     "%s%sauthenc(%s,%s)%s",
-			     x->geniv ?: "", x->geniv ? "(" : "",
+			     "authenc(%s,%s)",
 			     x->aalg ? x->aalg->alg_name : "digest_null",
-			     x->ealg->alg_name,
-			     x->geniv ? ")" : "") >= CRYPTO_MAX_ALG_NAME)
-			goto error;
+			     x->ealg->alg_name) >= CRYPTO_MAX_ALG_NAME){
+			     goto error;
+		}
 	}
 
 	aead = crypto_alloc_aead(authenc_name, 0, 0);

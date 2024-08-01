@@ -56,6 +56,11 @@ config SCSI_MQ_DEFAULT
 
 	  If unsure say N.
 
+config SCSI_HISI_MQ
+	bool "SCSI: use HISI optimise on SCSI MQ"
+	depends on SCSI
+	default n
+
 config SCSI_PROC_FS
 	bool "legacy /proc/scsi/ support"
 	depends on SCSI && PROC_FS

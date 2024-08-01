@@ -39,6 +39,10 @@
 
 #include "cma.h"
 
+#ifdef CONFIG_HISI_CMA_DEBUG
+#include <linux/hisi/hisi_cma_debug.h>
+#endif
+
 struct cma cma_areas[MAX_CMA_AREAS];
 unsigned cma_area_count;
 static DEFINE_MUTEX(cma_mutex);
@@ -364,6 +368,11 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align)
 	unsigned long mask, offset;
 	unsigned long pfn = -1;
 	unsigned long start = 0;
+#ifdef CONFIG_HISI_CMA_DEBUG
+	unsigned int used = 0;
+	unsigned long maxchunk = 0;
+	unsigned long fail_nr = 0;
+#endif
 	unsigned long bitmap_maxno, bitmap_no, bitmap_count;
 	struct page *page = NULL;
 	int ret;
@@ -389,6 +398,10 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align)
 				offset);
 		if (bitmap_no >= bitmap_maxno) {
 			mutex_unlock(&cma->lock);
+#ifdef CONFIG_HISI_CMA_DEBUG
+			pr_info("bitmap_no %ld >= bitmap_maxno %ld\n", bitmap_no, bitmap_maxno);
+			ret = -ENOMEM;
+#endif
 			break;
 		}
 		bitmap_set(cma->bitmap, bitmap_no, bitmap_count);
@@ -416,7 +429,22 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align)
 			 __func__, pfn_to_page(pfn));
 		/* try again with a bit different memory target */
 		start = bitmap_no + mask + 1;
+#ifdef CONFIG_HISI_CMA_DEBUG
+		fail_nr++;
+#endif
 	}
+#ifdef CONFIG_HISI_CMA_DEBUG
+	if (ret) {
+		used = cma_bitmap_used(cma);
+		maxchunk = cma_bitmap_maxchunk(cma);
+		pr_info("total %lu KB mask 0x%lx used %u KB "
+				"maxchunk %lu KB alloc %lu KB fail %lu times\n",
+					cma->count << (PAGE_SHIFT - 10), mask,
+					used << (PAGE_SHIFT - 10),
+					maxchunk << (PAGE_SHIFT - 10),
+					count << (PAGE_SHIFT - 10), fail_nr);
+	}
+#endif
 
 	trace_cma_alloc(pfn, page, count, align);
 
@@ -440,8 +468,6 @@ bool cma_release(struct cma *cma, const struct page *pages, unsigned int count)
 
 	if (!cma || !pages)
 		return false;
-
-	pr_debug("%s(page %p)\n", __func__, (void *)pages);
 
 	pfn = page_to_pfn(pages);
 

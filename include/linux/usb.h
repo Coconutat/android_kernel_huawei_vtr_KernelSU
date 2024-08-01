@@ -50,6 +50,7 @@ struct ep_device;
  * struct usb_host_endpoint - host-side endpoint descriptor and queue
  * @desc: descriptor for this endpoint, wMaxPacketSize in native byteorder
  * @ss_ep_comp: SuperSpeed companion descriptor for this endpoint
+ * @ssp_isoc_ep_comp: SuperSpeedPlus isoc companion descriptor for this endpoint
  * @urb_list: urbs queued to this endpoint; maintained by usbcore
  * @hcpriv: for use by HCD; typically holds hardware dma queue head (QH)
  *	with one or more transfer descriptors (TDs) per urb
@@ -65,6 +66,7 @@ struct ep_device;
 struct usb_host_endpoint {
 	struct usb_endpoint_descriptor		desc;
 	struct usb_ss_ep_comp_descriptor	ss_ep_comp;
+	struct usb_ssp_isoc_ep_comp_descriptor	ssp_isoc_ep_comp;
 	struct list_head		urb_list;
 	void				*hcpriv;
 	struct ep_device		*ep_dev;	/* For sysfs info */
@@ -395,6 +397,18 @@ struct usb_bus {
 	struct mon_bus *mon_bus;	/* non-null when associated */
 	int monitored;			/* non-zero when monitored */
 #endif
+
+#ifdef CONFIG_HISI_USB_SKIP_RESUME
+	unsigned skip_resume:1;		/* All USB devices are brought into full
+					 * power state after system resume. It
+					 * is desirable for some buses to keep
+					 * their devices in suspend state even
+					 * after system resume. The devices
+					 * are resumed later when a remote
+					 * wakeup is detected or an interface
+					 * driver starts I/O.
+					 */
+#endif
 };
 
 struct usb_dev_state;
@@ -719,7 +733,7 @@ extern void usb_enable_ltm(struct usb_device *udev);
 
 static inline bool usb_device_supports_ltm(struct usb_device *udev)
 {
-	if (udev->speed != USB_SPEED_SUPER || !udev->bos || !udev->bos->ss_cap)
+	if (udev->speed < USB_SPEED_SUPER || !udev->bos || !udev->bos->ss_cap)
 		return false;
 	return udev->bos->ss_cap->bmAttributes & USB_LTM_SUPPORT;
 }
@@ -1241,6 +1255,10 @@ extern int usb_disabled(void);
 #define URB_DMA_SG_COMBINED	0x00400000	/* S-G entries were combined */
 #define URB_ALIGNED_TEMP_BUFFER	0x00800000	/* Temp buffer was alloc'd */
 
+#ifdef CONFIG_USB_DWC3_NYET_ABNORMAL
+#define URB_MAP_LOCAL_REALLOC	0x10000000	/* Memory mapping for Kirin970 ASP USB Controller */
+#endif
+
 struct usb_iso_packet_descriptor {
 	unsigned int offset;
 	unsigned int length;		/* expected length */
@@ -1472,6 +1490,10 @@ struct urb {
 	unsigned int transfer_flags;	/* (in) URB_SHORT_NOT_OK | ...*/
 	void *transfer_buffer;		/* (in) associated data buffer */
 	dma_addr_t transfer_dma;	/* (in) dma addr for transfer_buffer */
+#ifdef CONFIG_USB_DWC3_NYET_ABNORMAL
+	void *origin_transfer_buffer;
+	dma_addr_t origin_dma;
+#endif
 	struct scatterlist *sg;		/* (in) scatter gather buffer list */
 	int num_mapped_sgs;		/* (internal) mapped sg entries */
 	int num_sgs;			/* (in) number of entries in the sg list */
@@ -1568,7 +1590,7 @@ static inline void usb_fill_bulk_urb(struct urb *urb,
  * Initializes a interrupt urb with the proper information needed to submit
  * it to a device.
  *
- * Note that High Speed and SuperSpeed interrupt endpoints use a logarithmic
+ * Note that High Speed and SuperSpeed(+) interrupt endpoints use a logarithmic
  * encoding of the endpoint interval, and express polling intervals in
  * microframes (eight per millisecond) rather than in frames (one per
  * millisecond).
@@ -1594,7 +1616,7 @@ static inline void usb_fill_int_urb(struct urb *urb,
 	urb->complete = complete_fn;
 	urb->context = context;
 
-	if (dev->speed == USB_SPEED_HIGH || dev->speed == USB_SPEED_SUPER) {
+	if (dev->speed == USB_SPEED_HIGH || dev->speed >= USB_SPEED_SUPER) {
 		/* make sure interval is within allowed range */
 		interval = clamp(interval, 1, 16);
 
@@ -1813,7 +1835,7 @@ void usb_sg_wait(struct usb_sg_request *io);
 static inline unsigned int __create_pipe(struct usb_device *dev,
 		unsigned int endpoint)
 {
-	return (dev->devnum << 8) | (endpoint << 15);
+	return (dev->devnum << 8) | (endpoint << 15); /* [false alarm]:this is original code */
 }
 
 /* Create various pipes... */
@@ -1861,7 +1883,7 @@ usb_maxpacket(struct usb_device *udev, int pipe, int is_out)
 		return 0;
 
 	/* NOTE:  only 0x07ff bits are for packet size... */
-	return usb_endpoint_maxp(&ep->desc);
+	return usb_endpoint_maxp(&ep->desc); /* [false alarm]:this is original code */
 }
 
 /* ----------------------------------------------------------------------- */

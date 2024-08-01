@@ -202,6 +202,13 @@ enum cfg80211_event_type {
 	EVENT_DISCONNECTED,
 	EVENT_IBSS_JOINED,
 	EVENT_STOPPED,
+#ifdef CONFIG_HW_VOWIFI
+	EVENT_DRV_VOWIFI,
+#endif
+#ifdef CONFIG_HW_ABS
+	EVENT_DRV_ANT,
+#endif
+	EVENT_DRV_LAST
 };
 
 struct cfg80211_event {

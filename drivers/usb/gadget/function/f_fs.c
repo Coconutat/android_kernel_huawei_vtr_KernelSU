@@ -494,6 +494,12 @@ static ssize_t ffs_ep0_read(struct file *file, char __user *buf,
 
 		spin_unlock_irq(&ffs->ev.waitq.lock);
 
+		if (len > PAGE_SIZE) {
+			pr_err("[%s] read len exceeds PAGE_SIZE\n", __func__);
+			ret = -EINVAL;
+			goto done_mutex;
+		}
+
 		if (likely(len)) {
 			data = kmalloc(len, GFP_KERNEL);
 			if (unlikely(!data)) {
@@ -837,7 +843,12 @@ static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 			} else if (unlikely(
 				   wait_for_completion_interruptible(&done))) {
 				ret = -EINTR;
-				usb_ep_dequeue(ep->ep, req);
+				spin_lock_irq(&epfile->ffs->eps_lock);
+				if (epfile->ep != ep)
+					ret = -ESHUTDOWN;
+				else
+					usb_ep_dequeue(ep->ep, req);
+				spin_unlock_irq(&epfile->ffs->eps_lock);
 			} else {
 				/*
 				 * XXX We may end up silently droping data
@@ -846,11 +857,19 @@ static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 				 * to maxpacketsize), we may end up with more
 				 * data then user space has space for.
 				 */
-				ret = ep->status;
-				if (io_data->read && ret > 0) {
-					ret = copy_to_iter(data, ret, &io_data->data);
-					if (!ret)
-						ret = -EFAULT;
+				spin_lock_irq(&epfile->ffs->eps_lock);
+				if (epfile->ep != ep) {
+					/* In the meantime, endpoint got disabled or changed. */
+					ret = -ESHUTDOWN;
+					spin_unlock_irq(&epfile->ffs->eps_lock);
+				} else {
+					ret = ep->status;
+					spin_unlock_irq(&epfile->ffs->eps_lock);
+					if (io_data->read && ret > 0) {
+						ret = copy_to_iter(data, ret, &io_data->data);
+						if (!ret)
+							ret = -EFAULT;
+					}
 				}
 			}
 			kfree(data);
@@ -1671,10 +1690,20 @@ static int ffs_func_eps_enable(struct ffs_function *func)
 		ep->ep->driver_data = ep;
 		ep->ep->desc = ds;
 
+#ifdef CONFIG_HISI_USB_CONFIGFS
+		if (config_ep_by_speed(ffs->gadget, &func->function,
+					ep->ep)) {
+			pr_err("ffs: config ep fail!\n");
+			ret = -EINVAL;
+			break;
+		}
+#endif
+
 		if (needs_comp_desc) {
-			comp_desc = (struct usb_ss_ep_comp_descriptor *)(ds +
+			comp_desc = (struct usb_ss_ep_comp_descriptor *)((char *)ds +
 					USB_DT_ENDPOINT_SIZE);
 			ep->ep->maxburst = comp_desc->bMaxBurst + 1;
+
 			ep->ep->comp_desc = comp_desc;
 		}
 
@@ -2759,6 +2788,11 @@ static int _ffs_func_bind(struct usb_configuration *c,
 	struct ffs_data *ffs = func->ffs;
 
 	const int full = !!func->ffs->fs_descs_count;
+	/* Always read descriptor regardless of max_speed of gadget */
+	/* const int high = gadget_is_dualspeed(func->gadget) && */
+		/* func->ffs->hs_descs_count; */
+	/* const int super = gadget_is_superspeed(func->gadget) && */
+		/* func->ffs->ss_descs_count; */
 	const int high = !!func->ffs->hs_descs_count;
 	const int super = !!func->ffs->ss_descs_count;
 
@@ -2883,7 +2917,7 @@ static int _ffs_func_bind(struct usb_configuration *c,
 		goto error;
 
 	func->function.os_desc_table = vla_ptr(vlabuf, d, os_desc_table);
-	if (c->cdev->use_os_string)
+	if (c->cdev->use_os_string) {
 		for (i = 0; i < ffs->interfaces_count; ++i) {
 			struct usb_os_desc *desc;
 
@@ -2894,13 +2928,17 @@ static int _ffs_func_bind(struct usb_configuration *c,
 				vla_ptr(vlabuf, d, ext_compat) + i * 16;
 			INIT_LIST_HEAD(&desc->ext_prop);
 		}
-	ret = ffs_do_os_descs(ffs->ms_os_descs_count,
-			      vla_ptr(vlabuf, d, raw_descs) +
-			      fs_len + hs_len + ss_len,
-			      d_raw_descs__sz - fs_len - hs_len - ss_len,
-			      __ffs_func_bind_do_os_desc, func);
-	if (unlikely(ret < 0))
-		goto error;
+		/* Do ffs_do_os_descs while c->cdev->use_os_string is true,
+		 * otherwise, it will cause panic when ffs->ms_os_descs_count
+		 * is not 0. */
+		ret = ffs_do_os_descs(ffs->ms_os_descs_count,
+				vla_ptr(vlabuf, d, raw_descs) +
+				fs_len + hs_len + ss_len,
+				d_raw_descs__sz - fs_len - hs_len - ss_len,
+				__ffs_func_bind_do_os_desc, func);
+		if (unlikely(ret < 0))
+			goto error;
+	}
 	func->function.os_desc_n =
 		c->cdev->use_os_string ? ffs->interfaces_count : 0;
 
@@ -3009,7 +3047,7 @@ static int ffs_func_setup(struct usb_function *f,
 	 * as well (as it's straightforward) but what to do with any
 	 * other request?
 	 */
-	if (ffs->state != FFS_ACTIVE)
+	if (!ffs || ffs->state != FFS_ACTIVE)
 		return -ENODEV;
 
 	switch (creq->bRequestType & USB_RECIP_MASK) {
@@ -3464,7 +3502,6 @@ static void ffs_closed(struct ffs_data *ffs)
 {
 	struct ffs_dev *ffs_obj;
 	struct f_fs_opts *opts;
-	struct config_item *ci;
 
 	ENTER();
 	ffs_dev_lock();
@@ -3488,12 +3525,19 @@ static void ffs_closed(struct ffs_data *ffs)
 	    || !atomic_read(&opts->func_inst.group.cg_item.ci_kref.refcount))
 		goto done;
 
-	ci = opts->func_inst.group.cg_item.ci_parent->ci_parent;
-	ffs_dev_unlock();
-
-	if (test_bit(FFS_FL_BOUND, &ffs->flags))
-		unregister_gadget_item(ci);
-	return;
+	/* do unregister only when there are ffs functions bound */
+	if (opts->refcnt || ffs->gadget) {
+		/*
+		 * Do ffs_dev_unlock before unregister_gadget_item,
+		 * otherwise it will cause deadlock when
+		 * gadget_dev_desc_UDC_store has got gi->lock
+		 * and ffs_do_functionfs_bind try ffs_dev_lock.
+		 */
+		ffs_dev_unlock();
+		unregister_gadget_item(ffs_obj->opts->
+				func_inst.group.cg_item.ci_parent->ci_parent);
+		return;
+	}
 done:
 	ffs_dev_unlock();
 }

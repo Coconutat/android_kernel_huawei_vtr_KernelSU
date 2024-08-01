@@ -30,6 +30,13 @@
 
 #include <linux/uaccess.h>
 
+#ifdef CONFIG_HW_MMC_MAINTENANCE_CMD
+extern const struct file_operations mmc_cmd_fops;
+#endif
+#ifdef CONFIG_HW_MMC_MAINTENANCE_DATA
+extern const struct file_operations mmc_data_fops;
+#endif
+
 #ifdef CONFIG_IA64
 # include <linux/efi.h>
 #endif
@@ -824,6 +831,12 @@ static const struct memdev {
 	 [9] = { "urandom", 0666, &urandom_fops, 0 },
 #ifdef CONFIG_PRINTK
 	[11] = { "kmsg", 0644, &kmsg_fops, 0 },
+#endif
+#ifdef CONFIG_HW_MMC_MAINTENANCE_CMD
+	[12] = { "mmc_cmd", 0664, &mmc_cmd_fops, 0 },
+#endif
+#ifdef CONFIG_HW_MMC_MAINTENANCE_DATA
+	[13] = { "mmc_data", 0664, &mmc_data_fops, 0 },
 #endif
 };
 

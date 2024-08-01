@@ -7,6 +7,7 @@
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/export.h>
+#include <linux/module.h>
 #include <linux/namei.h>
 #include <linux/sched.h>
 #include <linux/writeback.h>
@@ -16,6 +17,9 @@
 #include <linux/quotaops.h>
 #include <linux/backing-dev.h>
 #include "internal.h"
+
+bool fsync_enabled = true;
+module_param(fsync_enabled, bool, 0755);
 
 #define VALID_FLAGS (SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE| \
 			SYNC_FILE_RANGE_WAIT_AFTER)
@@ -157,6 +161,9 @@ SYSCALL_DEFINE1(syncfs, int, fd)
 	struct super_block *sb;
 	int ret;
 
+	if (!fsync_enabled)
+		return 0;
+
 	if (!f.file)
 		return -EBADF;
 	sb = f.file->f_path.dentry->d_sb;
@@ -183,6 +190,12 @@ SYSCALL_DEFINE1(syncfs, int, fd)
 int vfs_fsync_range(struct file *file, loff_t start, loff_t end, int datasync)
 {
 	struct inode *inode = file->f_mapping->host;
+#ifdef CONFIG_HISI_PAGECACHE_DEBUG
+	int ret;
+#endif
+
+	if (!fsync_enabled)
+		return 0;
 
 	if (!file->f_op->fsync)
 		return -EINVAL;
@@ -192,7 +205,17 @@ int vfs_fsync_range(struct file *file, loff_t start, loff_t end, int datasync)
 		spin_unlock(&inode->i_lock);
 		mark_inode_dirty_sync(inode);
 	}
+
+#ifdef CONFIG_HISI_PAGECACHE_DEBUG
+	pgcache_log_path(BIT_FSYNC_SYSCALL_DUMP, &(file->f_path),
+			"fsync range start, datasync:, %d", datasync);
+	ret = file->f_op->fsync(file, start, end, datasync);
+	pgcache_log_path(BIT_FSYNC_SYSCALL_DUMP, &(file->f_path),
+			"fsync range end, datasync:, %d", datasync);
+	return ret;
+#else
 	return file->f_op->fsync(file, start, end, datasync);
+#endif
 }
 EXPORT_SYMBOL(vfs_fsync_range);
 
@@ -206,6 +229,9 @@ EXPORT_SYMBOL(vfs_fsync_range);
  */
 int vfs_fsync(struct file *file, int datasync)
 {
+	if (!fsync_enabled)
+		return 0;
+		
 	return vfs_fsync_range(file, 0, LLONG_MAX, datasync);
 }
 EXPORT_SYMBOL(vfs_fsync);
@@ -214,21 +240,31 @@ static int do_fsync(unsigned int fd, int datasync)
 {
 	struct fd f = fdget(fd);
 	int ret = -EBADF;
+	
+	if (!fsync_enabled)
+		return 0;
 
 	if (f.file) {
 		ret = vfs_fsync(f.file, datasync);
 		fdput(f);
+		inc_syscfs(current);
 	}
 	return ret;
 }
 
 SYSCALL_DEFINE1(fsync, unsigned int, fd)
 {
+	if (!fsync_enabled)
+		return 0;
+
 	return do_fsync(fd, 0);
 }
 
 SYSCALL_DEFINE1(fdatasync, unsigned int, fd)
 {
+	if (!fsync_enabled)
+		return 0;
+		
 	return do_fsync(fd, 1);
 }
 
@@ -288,6 +324,9 @@ SYSCALL_DEFINE4(sync_file_range, int, fd, loff_t, offset, loff_t, nbytes,
 	loff_t endbyte;			/* inclusive */
 	umode_t i_mode;
 
+	if (!fsync_enabled)
+		return 0;
+
 	ret = -EINVAL;
 	if (flags & ~VALID_FLAGS)
 		goto out;
@@ -341,6 +380,9 @@ SYSCALL_DEFINE4(sync_file_range, int, fd, loff_t, offset, loff_t, nbytes,
 	}
 
 	ret = 0;
+	pgcache_log_path(BIT_FSYNC_SYSCALL_DUMP, &(f.file->f_path),
+			"sync file range start, offset:, %ld, end:, %ld, flags:, %d",
+			offset, endbyte, flags);
 	if (flags & SYNC_FILE_RANGE_WAIT_BEFORE) {
 		ret = filemap_fdatawait_range(mapping, offset, endbyte);
 		if (ret < 0)
@@ -358,6 +400,9 @@ SYSCALL_DEFINE4(sync_file_range, int, fd, loff_t, offset, loff_t, nbytes,
 		ret = filemap_fdatawait_range(mapping, offset, endbyte);
 
 out_put:
+	pgcache_log_path(BIT_FSYNC_SYSCALL_DUMP, &(f.file->f_path),
+			"sync file range end, offset:, %ld, end:, %ld, flags:, %d",
+			offset, endbyte, flags);
 	fdput(f);
 out:
 	return ret;

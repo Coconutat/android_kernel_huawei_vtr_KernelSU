@@ -260,14 +260,23 @@ static void tcp_lp_rtt_sample(struct sock *sk, u32 rtt)
  * newReno in increase case.
  * We work it out by following the idea from TCP-LP's paper directly
  */
+#ifdef CONFIG_TCP_CONG_BBR
+static void tcp_lp_pkts_acked(struct sock *sk, const struct ack_sample *sample)
+#else
 static void tcp_lp_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt_us)
+#endif
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct lp *lp = inet_csk_ca(sk);
 	u32 delta;
 
+#ifdef CONFIG_TCP_CONG_BBR
+	if (sample->rtt_us > 0)
+		tcp_lp_rtt_sample(sk, sample->rtt_us);
+#else
 	if (rtt_us > 0)
 		tcp_lp_rtt_sample(sk, rtt_us);
+#endif
 
 	/* calc inference */
 	delta = tcp_time_stamp - tp->rx_opt.rcv_tsecr;

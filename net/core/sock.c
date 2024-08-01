@@ -141,7 +141,15 @@
 #include <net/tcp.h>
 #endif
 
+#ifdef CONFIG_ANDROID_PARANOID_NETWORK
+#include <linux/android_aid.h>
+#endif
+
 #include <net/busy_poll.h>
+
+#ifdef CONFIG_HW_QTAGUID_PID
+#include <huawei_platform/net/qtaguid_pid/qtaguid_pid.h>
+#endif
 
 static DEFINE_MUTEX(proto_list_mutex);
 static LIST_HEAD(proto_list);
@@ -566,7 +574,7 @@ static int sock_setbindtodevice(struct sock *sk, char __user *optval,
 
 	/* Sorry... */
 	ret = -EPERM;
-	if (!ns_capable(net->user_ns, CAP_NET_RAW))
+	if (!ns_capable(net->user_ns, CAP_NET_RAW) && !in_egroup_p(AID_INET))	
 		goto out;
 
 	ret = -EINVAL;
@@ -994,6 +1002,12 @@ set_rcvbuf:
 #endif
 
 	case SO_MAX_PACING_RATE:
+#ifdef CONFIG_TCP_CONG_BBR
+		if (val != ~0U)
+			cmpxchg(&sk->sk_pacing_status,
+				SK_PACING_NONE,
+				SK_PACING_NEEDED);
+#endif
 		sk->sk_max_pacing_rate = val;
 		sk->sk_pacing_rate = min(sk->sk_pacing_rate,
 					 sk->sk_max_pacing_rate);
@@ -1431,6 +1445,10 @@ struct sock *sk_alloc(struct net *net, int family, gfp_t priority,
 		sock_net_set(sk, net);
 		atomic_set(&sk->sk_wmem_alloc, 1);
 
+#ifdef CONFIG_HWDPI_MODULE
+		sk->sk_hwdpi_mark = 0;
+#endif
+
 		sock_update_classid(sk);
 		sock_update_netprioidx(sk);
 	}
@@ -1442,6 +1460,10 @@ EXPORT_SYMBOL(sk_alloc);
 void sk_destruct(struct sock *sk)
 {
 	struct sk_filter *filter;
+
+#ifdef CONFIG_HUAWEI_BASTET
+	bastet_sock_release(sk);
+#endif
 
 	if (sk->sk_destruct)
 		sk->sk_destruct(sk);
@@ -2397,8 +2419,11 @@ void sock_init_data(struct socket *sock, struct sock *sk)
 		sk->sk_type	=	sock->type;
 		sk->sk_wq	=	sock->wq;
 		sock->sk	=	sk;
-	} else
+		sk->sk_uid	=	SOCK_INODE(sock)->i_uid;
+	} else {
 		sk->sk_wq	=	NULL;
+		sk->sk_uid	=	make_kuid(sock_net(sk)->user_ns, 0);
+	}
 
 	rwlock_init(&sk->sk_callback_lock);
 	lockdep_set_class_and_name(&sk->sk_callback_lock,
@@ -2673,6 +2698,10 @@ EXPORT_SYMBOL(compat_sock_common_setsockopt);
 
 void sk_common_release(struct sock *sk)
 {
+#ifdef CONFIG_HW_QTAGUID_PID
+	qtaguid_pid_remove(sk);
+#endif
+
 	if (sk->sk_prot->destroy)
 		sk->sk_prot->destroy(sk);
 

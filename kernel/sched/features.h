@@ -69,3 +69,23 @@ SCHED_FEAT(RT_RUNTIME_SHARE, true)
 SCHED_FEAT(LB_MIN, false)
 SCHED_FEAT(ATTACH_AGE_LOAD, true)
 
+/*
+ * Energy aware scheduling. Use platform energy model to guide scheduling
+ * decisions optimizing for energy efficiency.
+ */
+#ifdef CONFIG_DEFAULT_USE_ENERGY_AWARE
+SCHED_FEAT(ENERGY_AWARE, true)
+#else
+SCHED_FEAT(ENERGY_AWARE, false)
+#endif
+
+ /*
+  * Apply schedtune boost hold to tasks of all sched classes.
+  * If enabled, schedtune will hold the boost applied to a CPU
+  * for 50ms regardless of task activation - if the task is
+  * still running 50ms later, the boost hold expires and schedtune
+  * boost will expire immediately the task stops.
+  * If disabled, this behaviour will only apply to tasks of the
+  * RT class.
+  */
+ SCHED_FEAT(SCHEDTUNE_BOOST_HOLD_ALL, true)

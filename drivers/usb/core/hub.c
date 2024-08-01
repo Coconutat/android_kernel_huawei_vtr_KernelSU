@@ -33,6 +33,12 @@
 #include "hub.h"
 #include "otg_whitelist.h"
 
+#include <linux/hisi/usb/hisi_usb.h>
+
+#ifdef CONFIG_HUAWEI_DOCK_HEADSET_QUIRK
+#include <huawei_platform/usb/hw_pd_dev.h>
+#endif
+
 #define USB_VENDOR_GENESYS_LOGIC		0x05e3
 #define HUB_QUIRK_CHECK_PORT_AUTOSUSPEND	0x01
 
@@ -105,6 +111,8 @@ static int hub_port_disable(struct usb_hub *hub, int port1, int set_state);
 
 static inline char *portspeed(struct usb_hub *hub, int portstatus)
 {
+	if (hub_is_superspeedplus(hub->hdev))
+		return "10.0 Gb/s";
 	if (hub_is_superspeed(hub->hdev))
 		return "5.0 Gb/s";
 	if (portstatus & USB_PORT_STAT_HIGH_SPEED)
@@ -547,29 +555,34 @@ static int get_hub_status(struct usb_device *hdev,
 
 /*
  * USB 2.0 spec Section 11.24.2.7
+ * USB 3.1 takes into use the wValue and wLength fields, spec Section 10.16.2.6
  */
 static int get_port_status(struct usb_device *hdev, int port1,
-		struct usb_port_status *data)
+			   void *data, u16 value, u16 length)
 {
 	int i, status = -ETIMEDOUT;
 
 	for (i = 0; i < USB_STS_RETRIES &&
 			(status == -ETIMEDOUT || status == -EPIPE); i++) {
 		status = usb_control_msg(hdev, usb_rcvctrlpipe(hdev, 0),
-			USB_REQ_GET_STATUS, USB_DIR_IN | USB_RT_PORT, 0, port1,
-			data, sizeof(*data), USB_STS_TIMEOUT);
+			USB_REQ_GET_STATUS, USB_DIR_IN | USB_RT_PORT, value,
+			port1, data, length, USB_STS_TIMEOUT);
 	}
 	return status;
 }
 
-static int hub_port_status(struct usb_hub *hub, int port1,
-		u16 *status, u16 *change)
+static int hub_ext_port_status(struct usb_hub *hub, int port1, int type,
+			       u16 *status, u16 *change, u32 *ext_status)
 {
 	int ret;
+	int len = 4;
+
+	if (type != HUB_PORT_STATUS)
+		len = 8;
 
 	mutex_lock(&hub->status_mutex);
-	ret = get_port_status(hub->hdev, port1, &hub->status->port);
-	if (ret < 4) {
+	ret = get_port_status(hub->hdev, port1, &hub->status->port, type, len);
+	if (ret < len) {
 		if (ret != -ENODEV)
 			dev_err(hub->intfdev,
 				"%s failed (err = %d)\n", __func__, ret);
@@ -578,11 +591,20 @@ static int hub_port_status(struct usb_hub *hub, int port1,
 	} else {
 		*status = le16_to_cpu(hub->status->port.wPortStatus);
 		*change = le16_to_cpu(hub->status->port.wPortChange);
-
+		if (type != HUB_PORT_STATUS && ext_status)
+			*ext_status = le32_to_cpu(
+				hub->status->port.dwExtPortStatus);
 		ret = 0;
 	}
 	mutex_unlock(&hub->status_mutex);
 	return ret;
+}
+
+static int hub_port_status(struct usb_hub *hub, int port1,
+		u16 *status, u16 *change)
+{
+	return hub_ext_port_status(hub, port1, HUB_PORT_STATUS,
+				   status, change, NULL);
 }
 
 static void kick_hub_wq(struct usb_hub *hub)
@@ -1718,6 +1740,7 @@ static int hub_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	}
 
 	if (hdev->level == MAX_TOPO_LEVEL) {
+		usb_host_abnormal_event_notify(USB_HOST_EVENT_HUB_TOO_DEEP);
 		dev_err(&intf->dev,
 			"Unsupported bus topology: hub nested too deep\n");
 		return -E2BIG;
@@ -2559,6 +2582,32 @@ out_authorized:
 	return result;
 }
 
+/*
+ * Return 1 if port speed is SuperSpeedPlus, 0 otherwise
+ * check it from the link protocol field of the current speed ID attribute.
+ * current speed ID is got from ext port status request. Sublink speed attribute
+ * table is returned with the hub BOS SSP device capability descriptor
+ */
+static int port_speed_is_ssp(struct usb_device *hdev, int speed_id)
+{
+	int ssa_count;
+	u32 ss_attr;
+	int i;
+	struct usb_ssp_cap_descriptor *ssp_cap = hdev->bos->ssp_cap;
+
+	if (!ssp_cap)
+		return 0;
+
+	ssa_count = le32_to_cpu(ssp_cap->bmAttributes) &
+		USB_SSP_SUBLINK_SPEED_ATTRIBS;
+
+	for (i = 0; i <= ssa_count; i++) {
+		ss_attr = le32_to_cpu(ssp_cap->bmSublinkSpeedAttr[i]);
+		if (speed_id == (ss_attr & USB_SSP_SUBLINK_SPEED_SSID))
+			return !!(ss_attr & USB_SSP_SUBLINK_SPEED_LP);
+	}
+	return 0;
+}
 
 /* Returns 1 if @hub is a WUSB root hub, 0 otherwise */
 static unsigned hub_is_wusb(struct usb_hub *hub)
@@ -2623,6 +2672,7 @@ static int hub_port_wait_reset(struct usb_hub *hub, int port1,
 	int delay_time, ret;
 	u16 portstatus;
 	u16 portchange;
+	u32 ext_portstatus = 0;
 
 	for (delay_time = 0;
 			delay_time < HUB_RESET_TIMEOUT;
@@ -2631,7 +2681,14 @@ static int hub_port_wait_reset(struct usb_hub *hub, int port1,
 		msleep(delay);
 
 		/* read and decode port status */
-		ret = hub_port_status(hub, port1, &portstatus, &portchange);
+		if (hub_is_superspeedplus(hub->hdev))
+			ret = hub_ext_port_status(hub, port1,
+						  HUB_EXT_PORT_STATUS,
+						  &portstatus, &portchange,
+						  &ext_portstatus);
+		else
+			ret = hub_port_status(hub, port1, &portstatus,
+					      &portchange);
 		if (ret < 0)
 			return ret;
 
@@ -2684,6 +2741,10 @@ static int hub_port_wait_reset(struct usb_hub *hub, int port1,
 
 	if (hub_is_wusb(hub))
 		udev->speed = USB_SPEED_WIRELESS;
+	else if (hub_is_superspeedplus(hub->hdev) &&
+		 port_speed_is_ssp(hub->hdev, ext_portstatus &
+				   USB_EXT_PORT_STAT_RX_SPEED_ID))
+		udev->speed = USB_SPEED_SUPER_PLUS;
 	else if (hub_is_superspeed(hub->hdev))
 		udev->speed = USB_SPEED_SUPER;
 	else if (portstatus & USB_PORT_STAT_HIGH_SPEED)
@@ -4255,7 +4316,7 @@ static void hub_set_initial_usb2_lpm_policy(struct usb_device *udev)
 	if (hub)
 		connect_type = hub->ports[udev->portnum - 1]->connect_type;
 
-	if ((udev->bos->ext_cap->bmAttributes & cpu_to_le32(USB_BESL_SUPPORT)) ||
+	if ((udev->bos && (udev->bos->ext_cap->bmAttributes & cpu_to_le32(USB_BESL_SUPPORT))) ||
 			connect_type == USB_PORT_CONNECT_TYPE_HARD_WIRED) {
 		udev->usb2_hw_lpm_allowed = 1;
 		usb_set_usb2_hardware_lpm(udev, 1);
@@ -5068,6 +5129,24 @@ static void port_event(struct usb_hub *hub, int port1)
 		hub_port_connect_change(hub, port1, portstatus, portchange);
 }
 
+#ifdef CONFIG_HUAWEI_DOCK_HEADSET_QUIRK
+static bool check_huawei_dock_quirk(struct usb_device *hdev,
+		struct usb_hub *hub, int port1)
+{
+	struct usb_port *port2_dev;
+
+	if (unlikely(port1 == 3 && hdev->descriptor.idVendor == 0x0bda &&
+				hdev->descriptor.idProduct ==0x5411 &&
+				pd_dpm_get_hw_dock_svid_exist())) {
+		port2_dev = hub->ports[1];
+		if (port2_dev->child)
+			return false;
+	}
+
+	return true;
+}
+#endif
+
 static void hub_event(struct work_struct *work)
 {
 	struct usb_device *hdev;
@@ -5145,7 +5224,10 @@ static void hub_event(struct work_struct *work)
 			pm_runtime_get_noresume(&port_dev->dev);
 			pm_runtime_barrier(&port_dev->dev);
 			usb_lock_port(port_dev);
-			port_event(hub, i);
+#ifdef CONFIG_HUAWEI_DOCK_HEADSET_QUIRK
+			if (check_huawei_dock_quirk(hdev, hub, i))
+#endif
+				port_event(hub, i);
 			usb_unlock_port(port_dev);
 			pm_runtime_put_sync(&port_dev->dev);
 		}
@@ -5522,6 +5604,12 @@ done:
 	return 0;
 
 re_enumerate:
+	/*
+	 * udev->bos may update during reset,
+	 * make sure usb2_hw_lpm_enabled cleared
+	 */
+	if (udev->usb2_hw_lpm_enabled == 1)
+		usb_set_usb2_hardware_lpm(udev, 0);
 	usb_release_bos_descriptor(udev);
 	udev->bos = bos;
 re_enumerate_no_bos:

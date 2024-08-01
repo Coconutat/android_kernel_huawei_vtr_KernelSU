@@ -69,6 +69,15 @@
 #include "xhci.h"
 #include "xhci-trace.h"
 
+#ifdef CONFIG_USB_DWC3_NYET_ABNORMAL
+#include <linux/hisi/usb/hisi_usb.h>
+
+#ifdef CONFIG_HUAWEI_DSM
+#include <dsm/dsm_pub.h>
+#endif
+
+#endif
+
 /*
  * Returns zero if the TRB isn't in this segment, otherwise it returns the DMA
  * address of the TRB.
@@ -285,71 +294,23 @@ static bool xhci_mod_cmd_timer(struct xhci_hcd *xhci, unsigned long delay)
 	return mod_delayed_work(system_wq, &xhci->cmd_timer, delay);
 }
 
-static struct xhci_command *xhci_next_queued_cmd(struct xhci_hcd *xhci)
-{
-	return list_first_entry_or_null(&xhci->cmd_list, struct xhci_command,
-					cmd_list);
-}
-
-/*
- * Turn all commands on command ring with status set to "aborted" to no-op trbs.
- * If there are other commands waiting then restart the ring and kick the timer.
- * This must be called with command ring stopped and xhci->lock held.
- */
-static void xhci_handle_stopped_cmd_ring(struct xhci_hcd *xhci,
-					 struct xhci_command *cur_cmd)
-{
-	struct xhci_command *i_cmd;
-	u32 cycle_state;
-
-	/* Turn all aborted commands in list to no-ops, then restart */
-	list_for_each_entry(i_cmd, &xhci->cmd_list, cmd_list) {
-
-		if (i_cmd->status != COMP_CMD_ABORT)
-			continue;
-
-		i_cmd->status = COMP_CMD_STOP;
-
-		xhci_dbg(xhci, "Turn aborted command %p to no-op\n",
-			 i_cmd->command_trb);
-		/* get cycle state from the original cmd trb */
-		cycle_state = le32_to_cpu(
-			i_cmd->command_trb->generic.field[3]) &	TRB_CYCLE;
-		/* modify the command trb to no-op command */
-		i_cmd->command_trb->generic.field[0] = 0;
-		i_cmd->command_trb->generic.field[1] = 0;
-		i_cmd->command_trb->generic.field[2] = 0;
-		i_cmd->command_trb->generic.field[3] = cpu_to_le32(
-			TRB_TYPE(TRB_CMD_NOOP) | cycle_state);
-
-		/*
-		 * caller waiting for completion is called when command
-		 *  completion event is received for these no-op commands
-		 */
-	}
-
-	xhci->cmd_ring_state = CMD_RING_STATE_RUNNING;
-
-	/* ring command ring doorbell to restart the command ring */
-	if ((xhci->cmd_ring->dequeue != xhci->cmd_ring->enqueue) &&
-	    !(xhci->xhc_state & XHCI_STATE_DYING)) {
-		xhci->current_cmd = cur_cmd;
-		xhci_mod_cmd_timer(xhci, XHCI_CMD_DEFAULT_TIMEOUT);
-		xhci_ring_cmd_db(xhci);
-	}
-}
-
-/* Must be called with xhci->lock held, releases and aquires lock back */
-static int xhci_abort_cmd_ring(struct xhci_hcd *xhci, unsigned long flags)
+static int xhci_abort_cmd_ring(struct xhci_hcd *xhci)
 {
 	u64 temp_64;
 	int ret;
 
 	xhci_dbg(xhci, "Abort command ring\n");
 
-	reinit_completion(&xhci->cmd_ring_stop_completion);
-
 	temp_64 = xhci_read_64(xhci, &xhci->op_regs->cmd_ring);
+	xhci->cmd_ring_state = CMD_RING_STATE_ABORTED;
+
+	/*
+	 * Writing the CMD_RING_ABORT bit should cause a cmd completion event,
+	 * however on some host hw the CMD_RING_RUNNING bit is correctly cleared
+	 * but the completion event in never sent. Use the cmd timeout timer to
+	 * handle those cases. Use twice the time to cover the bit polling retry
+	 */
+	xhci_mod_cmd_timer(xhci, 2 * XHCI_CMD_DEFAULT_TIMEOUT);
 	xhci_write_64(xhci, temp_64 | CMD_RING_ABORT,
 			&xhci->op_regs->cmd_ring);
 
@@ -369,30 +330,16 @@ static int xhci_abort_cmd_ring(struct xhci_hcd *xhci, unsigned long flags)
 		udelay(1000);
 		ret = xhci_handshake(&xhci->op_regs->cmd_ring,
 				     CMD_RING_RUNNING, 0, 3 * 1000 * 1000);
-		if (ret < 0) {
-			xhci_err(xhci, "Stopped the command ring failed, "
-				 "maybe the host is dead\n");
-			xhci->xhc_state |= XHCI_STATE_DYING;
-			xhci_quiesce(xhci);
-			xhci_halt(xhci);
-			return -ESHUTDOWN;
-		}
-	}
-	/*
-	 * Writing the CMD_RING_ABORT bit should cause a cmd completion event,
-	 * however on some host hw the CMD_RING_RUNNING bit is correctly cleared
-	 * but the completion event in never sent. Wait 2 secs (arbitrary
-	 * number) to handle those cases after negation of CMD_RING_RUNNING.
-	 */
-	spin_unlock_irqrestore(&xhci->lock, flags);
-	ret = wait_for_completion_timeout(&xhci->cmd_ring_stop_completion,
-					  msecs_to_jiffies(2000));
-	spin_lock_irqsave(&xhci->lock, flags);
-	if (!ret) {
-		xhci_dbg(xhci, "No stop event for abort, ring start fail?\n");
-		xhci_cleanup_command_queue(xhci);
-	} else {
-		xhci_handle_stopped_cmd_ring(xhci, xhci_next_queued_cmd(xhci));
+		if (ret == 0)
+			return 0;
+
+		xhci_err(xhci, "Stopped the command ring failed, "
+				"maybe the host is dead\n");
+		cancel_delayed_work(&xhci->cmd_timer);
+		xhci->xhc_state |= XHCI_STATE_DYING;
+		xhci_quiesce(xhci);
+		xhci_halt(xhci);
+		return -ESHUTDOWN;
 	}
 
 	return 0;
@@ -965,6 +912,17 @@ void xhci_stop_endpoint_command_watchdog(unsigned long arg)
 	usb_hc_died(xhci_to_hcd(xhci));
 	xhci_dbg_trace(xhci, trace_xhci_dbg_cancel_urb,
 			"xHCI host controller is dead.");
+
+#ifdef CONFIG_USB_DWC3_NYET_ABNORMAL
+	if ((xhci->quirks & XHCI_CTRL_NYET_ABNORMAL) &&
+			!(xhci->xhc_state & XHCI_STATE_REMOVING)) {
+		xhci_warn(xhci, "arm usb stop endpoint command failed, use hifi usb\n");
+		hisi_usb_otg_event(START_AP_USE_HIFIUSB);
+#ifdef CONFIG_HUAWEI_DSM
+		usb_dsm_report(DSM_USB_XHCI_CMD_TIMEOUT, "xhci command timeout\n");
+#endif
+	}
+#endif
 }
 
 
@@ -1267,12 +1225,64 @@ void xhci_cleanup_command_queue(struct xhci_hcd *xhci)
 		xhci_complete_del_and_free_cmd(cur_cmd, COMP_CMD_ABORT);
 }
 
+/*
+ * Turn all commands on command ring with status set to "aborted" to no-op trbs.
+ * If there are other commands waiting then restart the ring and kick the timer.
+ * This must be called with command ring stopped and xhci->lock held.
+ */
+static void xhci_handle_stopped_cmd_ring(struct xhci_hcd *xhci,
+					 struct xhci_command *cur_cmd)
+{
+	struct xhci_command *i_cmd, *tmp_cmd;
+	u32 cycle_state;
+
+	/* Turn all aborted commands in list to no-ops, then restart */
+	list_for_each_entry_safe(i_cmd, tmp_cmd, &xhci->cmd_list,
+				 cmd_list) {
+
+		if (i_cmd->status != COMP_CMD_ABORT)
+			continue;
+
+		i_cmd->status = COMP_CMD_STOP;
+
+		xhci_dbg(xhci, "Turn aborted command %p to no-op\n",
+			 i_cmd->command_trb);
+		/* get cycle state from the original cmd trb */
+		cycle_state = le32_to_cpu(
+			i_cmd->command_trb->generic.field[3]) &	TRB_CYCLE;
+		/* modify the command trb to no-op command */
+		i_cmd->command_trb->generic.field[0] = 0;
+		i_cmd->command_trb->generic.field[1] = 0;
+		i_cmd->command_trb->generic.field[2] = 0;
+		i_cmd->command_trb->generic.field[3] = cpu_to_le32(
+			TRB_TYPE(TRB_CMD_NOOP) | cycle_state);
+
+		/*
+		 * caller waiting for completion is called when command
+		 *  completion event is received for these no-op commands
+		 */
+	}
+
+	xhci->cmd_ring_state = CMD_RING_STATE_RUNNING;
+
+	/* ring command ring doorbell to restart the command ring */
+	if ((xhci->cmd_ring->dequeue != xhci->cmd_ring->enqueue) &&
+	    !(xhci->xhc_state & XHCI_STATE_DYING)) {
+		xhci->current_cmd = cur_cmd;
+		xhci_mod_cmd_timer(xhci, XHCI_CMD_DEFAULT_TIMEOUT);
+		xhci_ring_cmd_db(xhci);
+	}
+	return;
+}
+
+
 void xhci_handle_command_timeout(struct work_struct *work)
 {
 	struct xhci_hcd *xhci;
 	int ret;
 	unsigned long flags;
 	u64 hw_ring_state;
+	bool second_timeout = false;
 
 	xhci = container_of(to_delayed_work(work), struct xhci_hcd, cmd_timer);
 
@@ -1286,40 +1296,74 @@ void xhci_handle_command_timeout(struct work_struct *work)
 		spin_unlock_irqrestore(&xhci->lock, flags);
 		return;
 	}
+
 	/* mark this command to be cancelled */
+	if (xhci->current_cmd->status == COMP_CMD_ABORT)
+		second_timeout = true;
 	xhci->current_cmd->status = COMP_CMD_ABORT;
 
 	/* Make sure command ring is running before aborting it */
 	hw_ring_state = xhci_read_64(xhci, &xhci->op_regs->cmd_ring);
 	if ((xhci->cmd_ring_state & CMD_RING_STATE_RUNNING) &&
 	    (hw_ring_state & CMD_RING_RUNNING))  {
-		/* Prevent new doorbell, and start command abort */
-		xhci->cmd_ring_state = CMD_RING_STATE_ABORTED;
-		xhci_dbg(xhci, "Command timeout\n");
-		ret = xhci_abort_cmd_ring(xhci, flags);
+		xhci_info(xhci, "Command timeout\n");
+		ret = xhci_abort_cmd_ring(xhci);
 		if (unlikely(ret == -ESHUTDOWN)) {
 			xhci_err(xhci, "Abort command ring failed\n");
 			xhci_cleanup_command_queue(xhci);
 			spin_unlock_irqrestore(&xhci->lock, flags);
 			usb_hc_died(xhci_to_hcd(xhci)->primary_hcd);
-			xhci_dbg(xhci, "xHCI host controller is dead.\n");
+			xhci_info(xhci, "xHCI host controller is dead.\n");
 
+#ifdef CONFIG_USB_DWC3_NYET_ABNORMAL
+			if ((xhci->quirks & XHCI_CTRL_NYET_ABNORMAL) &&
+					!(xhci->xhc_state & XHCI_STATE_REMOVING)) {
+				xhci_warn(xhci, "arm usb abnormal, use hifi usb\n");
+				hisi_usb_otg_event(START_AP_USE_HIFIUSB);
+#ifdef CONFIG_HUAWEI_DSM
+				usb_dsm_report(DSM_USB_XHCI_CMD_TIMEOUT,
+						"xhci command timeout\n");
+#endif
+			}
+#endif
 			return;
 		}
 
 		goto time_out_completed;
 	}
 
-	/* host removed. Bail out */
-	if (xhci->xhc_state & XHCI_STATE_REMOVING) {
-		xhci_dbg(xhci, "host removed, ring start fail?\n");
+	/* command ring failed to restart, or host removed. Bail out */
+	if (second_timeout || xhci->xhc_state & XHCI_STATE_REMOVING) {
+		xhci_dbg(xhci, "command timed out twice, ring start fail?\n");
 		xhci_cleanup_command_queue(xhci);
 
 		goto time_out_completed;
 	}
 
+#ifdef CONFIG_USB_DWC3_NYET_ABNORMAL
+	if ((xhci->quirks & XHCI_CTRL_NYET_ABNORMAL) &&
+			!(xhci->xhc_state & XHCI_STATE_REMOVING)) {
+		xhci_warn(xhci, "arm usb abnormal, use hifi usb\n");
+
+		xhci_cleanup_command_queue(xhci);
+		xhci->xhc_state |= XHCI_STATE_DYING;
+		/* Disable interrupts from the host controller and start halting it */
+		xhci_quiesce(xhci);
+		spin_unlock_irqrestore(&xhci->lock, flags);
+		usb_hc_died(xhci_to_hcd(xhci)->primary_hcd);
+		xhci_info(xhci, "xHCI host controller is dead.\n");
+
+		hisi_usb_otg_event(START_AP_USE_HIFIUSB);
+
+#ifdef CONFIG_HUAWEI_DSM
+		usb_dsm_report(DSM_USB_XHCI_CMD_TIMEOUT, "xhci command timeout\n");
+#endif
+		return;
+	}
+#endif
+
 	/* command timeout on stopped ring, ring can't be aborted */
-	xhci_dbg(xhci, "Command timeout on stopped ring\n");
+	xhci_info(xhci, "Command timeout on stopped ring\n");
 	xhci_handle_stopped_cmd_ring(xhci, xhci->current_cmd);
 
 time_out_completed:
@@ -1363,7 +1407,7 @@ static void handle_cmd_completion(struct xhci_hcd *xhci,
 
 	/* If CMD ring stopped we own the trbs between enqueue and dequeue */
 	if (cmd_comp_code == COMP_CMD_STOP) {
-		complete_all(&xhci->cmd_ring_stop_completion);
+		xhci_handle_stopped_cmd_ring(xhci, cmd);
 		return;
 	}
 
@@ -1564,6 +1608,12 @@ static void handle_port_status(struct xhci_hcd *xhci,
 	hcd = xhci_to_hcd(xhci);
 	if ((major_revision == 0x03) != (hcd->speed >= HCD_USB3))
 		hcd = xhci->shared_hcd;
+
+	if (!hcd) {
+		xhci_warn(xhci, "hcd had been remove, ignore this event!\n");
+		bogus_port_status = true;
+		goto cleanup;
+	}
 
 	if (major_revision == 0) {
 		xhci_warn(xhci, "Event for port %u not in "
@@ -3556,6 +3606,16 @@ int xhci_queue_ctrl_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
 	/* Save the DMA address of the last TRB in the TD */
 	td->last_trb = ep_ring->enqueue;
 
+	if ((xhci->quirks & XHCI_CTRL_NYET_ABNORMAL) &&
+			(setup->bRequestType & USB_DIR_IN)) {
+		xhci_dbg(xhci, "delay status stage\n");
+		giveback_first_trb(xhci, slot_id, ep_index, 0,
+				start_cycle, start_trb);
+		wmb();
+
+		mdelay(2);
+	}
+
 	/* Queue status TRB - see Table 7 and sections 4.11.2.2 and 6.4.1.2.3 */
 	/* If the device sent data, the status stage is an OUT transfer */
 	if (urb->transfer_buffer_length > 0 && setup->bRequestType & USB_DIR_IN)
@@ -3569,8 +3629,13 @@ int xhci_queue_ctrl_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
 			/* Event on completion */
 			field | TRB_IOC | TRB_TYPE(TRB_STATUS) | ep_ring->cycle_state);
 
-	giveback_first_trb(xhci, slot_id, ep_index, 0,
-			start_cycle, start_trb);
+	if ((xhci->quirks & XHCI_CTRL_NYET_ABNORMAL) &&
+			(setup->bRequestType & USB_DIR_IN))
+		xhci_ring_ep_doorbell(xhci, slot_id, ep_index, 0);
+	else
+		giveback_first_trb(xhci, slot_id, ep_index, 0,
+				start_cycle, start_trb);
+
 	return 0;
 }
 

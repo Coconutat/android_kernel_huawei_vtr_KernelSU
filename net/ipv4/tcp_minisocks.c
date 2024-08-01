@@ -471,7 +471,11 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
 
 		newtp->srtt_us = 0;
 		newtp->mdev_us = jiffies_to_usecs(TCP_TIMEOUT_INIT);
+#ifdef CONFIG_TCP_CONG_BBR
+		minmax_reset(&newtp->rtt_min, tcp_time_stamp, ~0U);
+#else
 		newtp->rtt_min[0].rtt = ~0U;
+#endif
 		newicsk->icsk_rto = TCP_TIMEOUT_INIT;
 		newicsk->icsk_ack.lrcvtime = tcp_time_stamp;
 
@@ -494,6 +498,11 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
 		 */
 		newtp->snd_cwnd = TCP_INIT_CWND;
 		newtp->snd_cwnd_cnt = 0;
+
+#ifdef CONFIG_TCP_CONG_BBR
+		/* There's a bubble in the pipe until at least the first ACK. */
+		newtp->app_limited = ~0U;
+#endif
 
 		tcp_init_xmit_timers(newsk);
 		__skb_queue_head_init(&newtp->out_of_order_queue);

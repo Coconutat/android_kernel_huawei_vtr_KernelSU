@@ -41,6 +41,8 @@
 #include <linux/syscore_ops.h>
 #include <linux/version.h>
 #include <linux/ctype.h>
+#include <linux/mm.h>
+#include <linux/mempolicy.h>
 
 #include <linux/compat.h>
 #include <linux/syscalls.h>
@@ -62,6 +64,14 @@
 #include <asm/uaccess.h>
 #include <asm/io.h>
 #include <asm/unistd.h>
+
+#ifdef CONFIG_HW_IAWARE_THREAD_BOOST
+#include <cpu_netlink/cpu_netlink.h>
+#endif
+
+#ifdef CONFIG_HUAWEI_PROC_CHECK_ROOT
+#include <chipset_common/security/check_root.h>
+#endif
 
 #ifndef SET_UNALIGN_CTL
 # define SET_UNALIGN_CTL(a, b)	(-EINVAL)
@@ -373,6 +383,11 @@ SYSCALL_DEFINE2(setregid, gid_t, rgid, gid_t, egid)
 		new->sgid = new->egid;
 	new->fsgid = new->egid;
 
+#ifdef CONFIG_HUAWEI_PROC_CHECK_ROOT
+	if (!new->gid.val && (checkroot_setresgid(old->gid.val)))
+		goto error;
+#endif
+
 	return commit_creds(new);
 
 error:
@@ -409,6 +424,11 @@ SYSCALL_DEFINE1(setgid, gid_t, gid)
 		new->egid = new->fsgid = kgid;
 	else
 		goto error;
+
+#ifdef CONFIG_HUAWEI_PROC_CHECK_ROOT
+	if (!gid && (checkroot_setgid(old->gid.val)))
+		goto error;
+#endif
 
 	return commit_creds(new);
 
@@ -514,6 +534,11 @@ SYSCALL_DEFINE2(setreuid, uid_t, ruid, uid_t, euid)
 	if (retval < 0)
 		goto error;
 
+#ifdef CONFIG_HUAWEI_PROC_CHECK_ROOT
+	if (!new->uid.val && (checkroot_setresuid(old->uid.val)))
+		goto error;
+#endif
+
 	return commit_creds(new);
 
 error:
@@ -566,6 +591,11 @@ SYSCALL_DEFINE1(setuid, uid_t, uid)
 	retval = security_task_fix_setuid(new, old, LSM_SETID_ID);
 	if (retval < 0)
 		goto error;
+
+#ifdef CONFIG_HUAWEI_PROC_CHECK_ROOT
+	if (!uid && (checkroot_setuid(old->uid.val)))
+		goto error;
+#endif
 
 	return commit_creds(new);
 
@@ -637,6 +667,10 @@ SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)
 	if (retval < 0)
 		goto error;
 
+#ifdef CONFIG_HUAWEI_PROC_CHECK_ROOT
+	if (!new->uid.val && (checkroot_setresuid(old->uid.val)))
+		goto error;
+#endif
 	return commit_creds(new);
 
 error:
@@ -710,6 +744,11 @@ SYSCALL_DEFINE3(setresgid, gid_t, rgid, gid_t, egid, gid_t, sgid)
 	if (sgid != (gid_t) -1)
 		new->sgid = ksgid;
 	new->fsgid = new->egid;
+
+#ifdef CONFIG_HUAWEI_PROC_CHECK_ROOT
+	if (!new->gid.val && (checkroot_setresgid(old->gid.val)))
+		goto error;
+#endif
 
 	return commit_creds(new);
 
@@ -1153,6 +1192,8 @@ SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 	if (override_release(name->release, sizeof(name->release)))
 		return -EFAULT;
 	if (override_architecture(name))
+		return -EFAULT;
+	if (is_compat_task() && copy_to_user(name->machine, "armv7l", strlen("armv7l") + 1))
 		return -EFAULT;
 	return 0;
 }
@@ -2070,6 +2111,153 @@ static int prctl_get_tid_address(struct task_struct *me, int __user **tid_addr)
 }
 #endif
 
+#ifdef CONFIG_MMU
+static int prctl_update_vma_anon_name(struct vm_area_struct *vma,
+		struct vm_area_struct **prev,
+		unsigned long start, unsigned long end,
+		const char __user *name_addr)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	int error = 0;
+	pgoff_t pgoff;
+
+	if (name_addr == vma_get_anon_name(vma)) {
+		*prev = vma;
+		goto out;
+	}
+
+	pgoff = vma->vm_pgoff + ((start - vma->vm_start) >> PAGE_SHIFT);
+	*prev = vma_merge(mm, *prev, start, end, vma->vm_flags, vma->anon_vma,
+				vma->vm_file, pgoff, vma_policy(vma),
+				vma->vm_userfaultfd_ctx, name_addr);
+	if (*prev) {
+		vma = *prev;
+		goto success;
+	}
+
+	*prev = vma;
+
+	if (start != vma->vm_start) {
+		error = split_vma(mm, vma, start, 1);
+		if (error)
+			goto out;
+	}
+
+	if (end != vma->vm_end) {
+		error = split_vma(mm, vma, end, 0);
+		if (error)
+			goto out;
+	}
+
+success:
+	if (!vma->vm_file)
+		vma->anon_name = name_addr;
+
+out:
+	if (error == -ENOMEM)
+		error = -EAGAIN;
+	return error;
+}
+
+static int prctl_set_vma_anon_name(unsigned long start, unsigned long end,
+			unsigned long arg)
+{
+	unsigned long tmp;
+	struct vm_area_struct *vma, *prev;
+	int unmapped_error = 0;
+	int error = -EINVAL;
+
+	/*
+	 * If the interval [start,end) covers some unmapped address
+	 * ranges, just ignore them, but return -ENOMEM at the end.
+	 * - this matches the handling in madvise.
+	 */
+	vma = find_vma_prev(current->mm, start, &prev);
+	if (vma && start > vma->vm_start)
+		prev = vma;
+
+	for (;;) {
+		/* Still start < end. */
+		error = -ENOMEM;
+		if (!vma)
+			return error;
+
+		/* Here start < (end|vma->vm_end). */
+		if (start < vma->vm_start) {
+			unmapped_error = -ENOMEM;
+			start = vma->vm_start;
+			if (start >= end)
+				return error;
+		}
+
+		/* Here vma->vm_start <= start < (end|vma->vm_end) */
+		tmp = vma->vm_end;
+		if (end < tmp)
+			tmp = end;
+
+		/* Here vma->vm_start <= start < tmp <= (end|vma->vm_end). */
+		error = prctl_update_vma_anon_name(vma, &prev, start, tmp,
+				(const char __user *)arg);
+		if (error)
+			return error;
+		start = tmp;
+		if (prev && start < prev->vm_end)
+			start = prev->vm_end;
+		error = unmapped_error;
+		if (start >= end)
+			return error;
+		if (prev)
+			vma = prev->vm_next;
+		else	/* madvise_remove dropped mmap_sem */
+			vma = find_vma(current->mm, start);
+	}
+}
+
+static int prctl_set_vma(unsigned long opt, unsigned long start,
+		unsigned long len_in, unsigned long arg)
+{
+	struct mm_struct *mm = current->mm;
+	int error;
+	unsigned long len;
+	unsigned long end;
+
+	if (start & ~PAGE_MASK)
+		return -EINVAL;
+	len = (len_in + ~PAGE_MASK) & PAGE_MASK;
+
+	/* Check to see whether len was rounded up from small -ve to zero */
+	if (len_in && !len)
+		return -EINVAL;
+
+	end = start + len;
+	if (end < start)
+		return -EINVAL;
+
+	if (end == start)
+		return 0;
+
+	down_write(&mm->mmap_sem);
+
+	switch (opt) {
+	case PR_SET_VMA_ANON_NAME:
+		error = prctl_set_vma_anon_name(start, end, arg);
+		break;
+	default:
+		error = -EINVAL;
+	}
+
+	up_write(&mm->mmap_sem);
+
+	return error;
+}
+#else /* CONFIG_MMU */
+static int prctl_set_vma(unsigned long opt, unsigned long start,
+		unsigned long len_in, unsigned long arg)
+{
+	return -EINVAL;
+}
+#endif
+
 int __weak arch_prctl_spec_ctrl_get(struct task_struct *t, unsigned long which)
 {
 	return -EINVAL;
@@ -2085,6 +2273,7 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		unsigned long, arg4, unsigned long, arg5)
 {
 	struct task_struct *me = current;
+	struct task_struct *tsk;
 	unsigned char comm[sizeof(me->comm)];
 	long error;
 
@@ -2147,6 +2336,9 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 			return -EFAULT;
 		set_task_comm(me, comm);
 		proc_comm_connector(me);
+#ifdef CONFIG_HW_IAWARE_THREAD_BOOST
+		iaware_proc_comm_connector(me, comm);
+#endif
 		break;
 	case PR_GET_NAME:
 		get_task_comm(comm, me);
@@ -2178,7 +2370,10 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		error = perf_event_task_enable();
 		break;
 	case PR_GET_TIMERSLACK:
-		error = current->timer_slack_ns;
+		if (current->timer_slack_ns > ULONG_MAX)
+			error = ULONG_MAX;
+		else
+			error = current->timer_slack_ns;
 		break;
 	case PR_SET_TIMERSLACK:
 		if (arg2 <= 0)
@@ -2227,6 +2422,26 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 	case PR_GET_TID_ADDRESS:
 		error = prctl_get_tid_address(me, (int __user **)arg2);
 		break;
+	case PR_SET_TIMERSLACK_PID:
+		if (task_pid_vnr(current) != (pid_t)arg3 &&
+				!capable(CAP_SYS_NICE))
+			return -EPERM;
+		rcu_read_lock();
+		tsk = find_task_by_vpid((pid_t)arg3);
+		if (tsk == NULL) {
+			rcu_read_unlock();
+			return -EINVAL;
+		}
+		get_task_struct(tsk);
+		rcu_read_unlock();
+		if (arg2 <= 0)
+			tsk->timer_slack_ns =
+				tsk->default_timer_slack_ns;
+		else
+			tsk->timer_slack_ns = arg2;
+		put_task_struct(tsk);
+		error = 0;
+		break;
 	case PR_SET_CHILD_SUBREAPER:
 		me->signal->is_child_subreaper = !!arg2;
 		break;
@@ -2274,6 +2489,9 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		break;
 	case PR_GET_FP_MODE:
 		error = GET_FP_MODE(me);
+		break;
+	case PR_SET_VMA:
+		error = prctl_set_vma(arg2, arg3, arg4, arg5);
 		break;
 	case PR_GET_SPECULATION_CTRL:
 		if (arg3 || arg4 || arg5)

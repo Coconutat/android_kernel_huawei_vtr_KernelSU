@@ -80,7 +80,9 @@ struct cgroup_subsys_state *cgroup_get_e_css(struct cgroup *cgroup,
 					     struct cgroup_subsys *ss);
 struct cgroup_subsys_state *css_tryget_online_from_dir(struct dentry *dentry,
 						       struct cgroup_subsys *ss);
-
+#ifdef CONFIG_ROW_OPTIMIZATION
+extern int cgroup_update_ioprio(struct cgroup_subsys_state *css, int ioprio);
+#endif
 bool cgroup_is_descendant(struct cgroup *cgrp, struct cgroup *ancestor);
 int cgroup_attach_task_all(struct task_struct *from, struct task_struct *);
 int cgroup_transfer_tasks(struct cgroup *to, struct cgroup *from);
@@ -548,6 +550,15 @@ static inline void pr_cont_cgroup_path(struct cgroup *cgrp)
 	pr_cont_kernfs_path(cgrp->kn);
 }
 
+/*
+ * Default Android check for whether the current process is allowed to move a
+ * task across cgroups, either because CAP_SYS_NICE is set or because the uid
+ * of the calling process is the same as the moved task or because we are
+ * running as root.
+ * Returns 0 if this is allowed, or -EACCES otherwise.
+ */
+int subsys_cgroup_allow_attach(struct cgroup_taskset *tset);
+
 static inline void cgroup_init_kthreadd(void)
 {
 	/*
@@ -593,6 +604,10 @@ static inline int cgroup_init(void) { return 0; }
 static inline void cgroup_init_kthreadd(void) {}
 static inline void cgroup_kthread_ready(void) {}
 
+static inline int subsys_cgroup_allow_attach(void *tset)
+{
+	return 0;
+}
 #endif /* !CONFIG_CGROUPS */
 
 #endif /* _LINUX_CGROUP_H */

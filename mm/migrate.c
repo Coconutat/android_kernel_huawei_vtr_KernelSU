@@ -38,6 +38,7 @@
 #include <linux/balloon_compaction.h>
 #include <linux/mmu_notifier.h>
 #include <linux/page_idle.h>
+#include <linux/hisi/page_tracker.h>
 #include <linux/ptrace.h>
 
 #include <asm/tlbflush.h>
@@ -383,6 +384,8 @@ int migrate_page_move_mapping(struct address_space *mapping,
 	if (PageSwapCache(page)) {
 		SetPageSwapCache(newpage);
 		set_page_private(newpage, page_private(page));
+		__dec_zone_page_state(page, NR_SWAPCACHE);
+		__inc_zone_page_state(newpage, NR_SWAPCACHE);
 	}
 
 	/* Move dirty while page refs frozen and newpage not yet exposed */
@@ -557,6 +560,13 @@ void migrate_page_copy(struct page *newpage, struct page *page)
 	if (page_is_idle(page))
 		set_page_idle(newpage);
 
+#ifdef CONFIG_TASK_PROTECT_LRU
+	if (PageProtect(page)) {
+		SetPageProtect(newpage);
+		set_page_num(newpage, get_page_num(page));
+	}
+#endif
+
 	/*
 	 * Copy NUMA information to the new page, to prevent over-eager
 	 * future migrations of this same page.
@@ -607,6 +617,7 @@ int migrate_page(struct address_space *mapping,
 		return rc;
 
 	migrate_page_copy(newpage, page);
+	page_tracker_change_tracker(newpage, page);
 	return MIGRATEPAGE_SUCCESS;
 }
 EXPORT_SYMBOL(migrate_page);
@@ -891,7 +902,8 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 		VM_BUG_ON_PAGE(PageAnon(page) && !PageKsm(page) && !anon_vma,
 				page);
 		try_to_unmap(page,
-			TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS);
+			TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS,
+			NULL);
 		page_was_mapped = 1;
 	}
 
@@ -1061,7 +1073,8 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
 
 	if (page_mapped(hpage)) {
 		try_to_unmap(hpage,
-			TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS);
+			TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS,
+			NULL);
 		page_was_mapped = 1;
 	}
 

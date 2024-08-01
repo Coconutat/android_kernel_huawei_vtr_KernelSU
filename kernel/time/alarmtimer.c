@@ -25,6 +25,7 @@
 #include <linux/posix-timers.h>
 #include <linux/workqueue.h>
 #include <linux/freezer.h>
+#include <linux/module.h>
 
 /**
  * struct alarm_base - Alarm timer bases
@@ -195,7 +196,7 @@ static enum hrtimer_restart alarmtimer_fired(struct hrtimer *timer)
 	}
 	spin_unlock_irqrestore(&base->lock, flags);
 
-	return ret;
+	return ret;/*[false alarm]:return *//*lint !e64 */
 
 }
 
@@ -205,6 +206,13 @@ ktime_t alarm_expires_remaining(const struct alarm *alarm)
 	return ktime_sub(alarm->node.expires, base->gettime());
 }
 EXPORT_SYMBOL_GPL(alarm_expires_remaining);
+
+bool hw_alarm_stop = 0;
+module_param(hw_alarm_stop, bool, 0644);
+MODULE_PARM_DESC(hw_alarm_stop, "stop or not alarm");
+EXPORT_SYMBOL(hw_alarm_stop);
+
+extern unsigned int runmode_is_factory(void);
 
 #ifdef CONFIG_RTC_CLASS
 /**
@@ -221,10 +229,19 @@ static int alarmtimer_suspend(struct device *dev)
 {
 	struct rtc_time tm;
 	ktime_t min, now;
+#ifdef CONFIG_HISI_RTC_LOG
+	ktime_t alarm;
+	int err;
+#endif
 	unsigned long flags;
 	struct rtc_device *rtc;
 	int i;
 	int ret;
+
+	if (hw_alarm_stop && runmode_is_factory()){
+		pr_err("runmode_is_factory 1, forbid alarms\n");
+		return 0;
+	}
 
 	spin_lock_irqsave(&freezer_delta_lock, flags);
 	min = freezer_delta;
@@ -256,6 +273,21 @@ static int alarmtimer_suspend(struct device *dev)
 
 	if (ktime_to_ns(min) < 2 * NSEC_PER_SEC) {
 		__pm_wakeup_event(ws, 2 * MSEC_PER_SEC);
+#ifdef CONFIG_HISI_RTC_LOG
+		err = rtc_read_time(rtc, &tm);
+		if (err) {
+			printk(KERN_ERR "fail to read rtc time\n");
+		}
+		alarm = rtc_tm_to_ktime(tm);
+		alarm = ktime_add(alarm, min);
+		tm = rtc_ktime_to_tm(alarm);
+		printk(KERN_ERR "\n Too short to sleep \n");
+		printk(KERN_ERR "[%s:%d]  time %d-%d-%d %d:%d:%d\n",
+			__FUNCTION__, __LINE__,
+			tm.tm_year+1900, tm.tm_mon+1,
+			tm.tm_mday, tm.tm_hour,
+			tm.tm_min, tm.tm_sec);
+#endif
 		return -EBUSY;
 	}
 

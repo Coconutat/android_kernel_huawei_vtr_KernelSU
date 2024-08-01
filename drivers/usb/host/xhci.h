@@ -33,6 +33,7 @@
 /* Code sharing between pci-quirks and xhci hcd */
 #include	"xhci-ext-caps.h"
 #include "pci-quirks.h"
+#include "xhci-local-mem.h"
 
 /* xHCI PCI Configuration Registers */
 #define XHCI_SBRN_OFFSET	(0x60)
@@ -312,8 +313,6 @@ struct xhci_op_regs {
 #define XDEV_U2		(0x2 << 5)
 #define XDEV_U3		(0x3 << 5)
 #define XDEV_INACTIVE	(0x6 << 5)
-#define XDEV_POLLING	(0x7 << 5)
-#define XDEV_COMP_MODE  (0xa << 5)
 #define XDEV_RESUME	(0xf << 5)
 /* true: port has power (see HCC_PPC) */
 #define PORT_POWER	(1 << 9)
@@ -345,6 +344,7 @@ struct xhci_op_regs {
 #define	SLOT_SPEED_LS		(XDEV_LS << 10)
 #define	SLOT_SPEED_HS		(XDEV_HS << 10)
 #define	SLOT_SPEED_SS		(XDEV_SS << 10)
+#define	SLOT_SPEED_SSP		(XDEV_SSP << 10)
 /* Port Indicator Control */
 #define PORT_LED_OFF	(0 << 14)
 #define PORT_LED_AMBER	(1 << 14)
@@ -754,8 +754,9 @@ struct xhci_ep_ctx {
 #define GET_MAX_PACKET(p)	((p) & 0x7ff)
 
 /* tx_info bitmasks */
-#define AVG_TRB_LENGTH_FOR_EP(p)	((p) & 0xffff)
-#define MAX_ESIT_PAYLOAD_FOR_EP(p)	(((p) & 0xffff) << 16)
+#define EP_AVG_TRB_LENGTH(p)		((p) & 0xffff)
+#define EP_MAX_ESIT_PAYLOAD_LO(p)	(((p) & 0xffff) << 16)
+#define EP_MAX_ESIT_PAYLOAD_HI(p)	((((p) >> 16) & 0xff) << 24)
 #define CTX_TO_MAX_ESIT_PAYLOAD(p)	(((p) >> 16) & 0xffff)
 
 /* deq bitmasks */
@@ -1557,7 +1558,6 @@ struct xhci_hcd {
 	struct list_head        cmd_list;
 	unsigned int		cmd_ring_reserved_trbs;
 	struct delayed_work	cmd_timer;
-	struct completion	cmd_ring_stop_completion;
 	struct xhci_command	*current_cmd;
 	struct xhci_ring	*event_ring;
 	struct xhci_erst	erst;
@@ -1638,7 +1638,14 @@ struct xhci_hcd {
 /* For controllers with a broken beyond repair streams implementation */
 #define XHCI_BROKEN_STREAMS	(1 << 19)
 #define XHCI_PME_STUCK_QUIRK	(1 << 20)
-#define XHCI_MISSING_CAS	(1 << 24)
+#define XHCI_CTRL_NYET_ABNORMAL	(1 << 21)
+
+#ifdef CONFIG_USB_DWC3_NYET_ABNORMAL
+#define XHCI_DISABLE_LPM	(1 << 22)
+#define XHCI_NOT_SUP_SG		(1 << 23)
+#define XHCI_HCD_LOCAL_MEM	(1 << 24)
+#endif
+
 	unsigned int		num_active_eps;
 	unsigned int		limit_active_eps;
 	/* There are two roothubs to keep track of bus suspend info for */
@@ -1665,6 +1672,16 @@ struct xhci_hcd {
 	u32			port_status_u0;
 /* Compliance Mode Timer Triggered every 2 seconds */
 #define COMP_MODE_RCVRY_MSECS 2000
+
+#ifdef CONFIG_HISI_DEBUG_FS
+	struct dentry		*debugfs_root;
+#endif
+
+#ifdef CONFIG_USB_DWC3_NYET_ABNORMAL
+#define XHCI_DMA_POOL_NUM (9)
+	struct dma_pool		*pool[XHCI_DMA_POOL_NUM];
+	struct xhci_local_dma_manager dma_manager;
+#endif
 };
 
 /* Platform specific overrides to generic XHCI hc_driver ops */

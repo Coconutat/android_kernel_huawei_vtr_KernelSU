@@ -603,12 +603,25 @@ extern void untrack_pfn(struct vm_area_struct *vma, unsigned long pfn,
 			unsigned long size);
 #endif
 
+#ifdef CONFIG_UKSM
+static inline int is_uksm_zero_pfn(unsigned long pfn)
+{
+	extern unsigned long uksm_zero_pfn;
+        return pfn == uksm_zero_pfn;
+}
+#else
+static inline int is_uksm_zero_pfn(unsigned long pfn)
+{
+        return 0;
+}
+#endif
+
 #ifdef __HAVE_COLOR_ZERO_PAGE
 static inline int is_zero_pfn(unsigned long pfn)
 {
 	extern unsigned long zero_pfn;
 	unsigned long offset_from_zero_pfn = pfn - zero_pfn;
-	return offset_from_zero_pfn <= (zero_page_mask >> PAGE_SHIFT);
+	return offset_from_zero_pfn <= (zero_page_mask >> PAGE_SHIFT) || is_uksm_zero_pfn(pfn);
 }
 
 #define my_zero_pfn(addr)	page_to_pfn(ZERO_PAGE(addr))
@@ -617,7 +630,7 @@ static inline int is_zero_pfn(unsigned long pfn)
 static inline int is_zero_pfn(unsigned long pfn)
 {
 	extern unsigned long zero_pfn;
-	return pfn == zero_pfn;
+	return (pfn == zero_pfn) || (is_uksm_zero_pfn(pfn));
 }
 
 static inline unsigned long my_zero_pfn(unsigned long addr)
@@ -770,8 +783,8 @@ int pud_set_huge(pud_t *pud, phys_addr_t addr, pgprot_t prot);
 int pmd_set_huge(pmd_t *pmd, phys_addr_t addr, pgprot_t prot);
 int pud_clear_huge(pud_t *pud);
 int pmd_clear_huge(pmd_t *pmd);
-int pud_free_pmd_page(pud_t *pud, unsigned long addr);
-int pmd_free_pte_page(pmd_t *pmd, unsigned long addr);
+int pud_free_pmd_page(pud_t *pud);
+int pmd_free_pte_page(pmd_t *pmd);
 #else	/* !CONFIG_HAVE_ARCH_HUGE_VMAP */
 static inline int pud_set_huge(pud_t *pud, phys_addr_t addr, pgprot_t prot)
 {
@@ -789,11 +802,11 @@ static inline int pmd_clear_huge(pmd_t *pmd)
 {
 	return 0;
 }
-static inline int pud_free_pmd_page(pud_t *pud, unsigned long addr)
+static inline int pud_free_pmd_page(pud_t *pud)
 {
 	return 0;
 }
-static inline int pmd_free_pte_page(pmd_t *pmd, unsigned long addr)
+static inline int pmd_free_pte_page(pmd_t *pmd)
 {
 	return 0;
 }

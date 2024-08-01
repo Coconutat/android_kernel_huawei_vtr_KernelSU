@@ -51,6 +51,17 @@ extern int sysctl_legacy_va_layout;
 #define sysctl_legacy_va_layout 0
 #endif
 
+#ifdef CONFIG_HAVE_ARCH_MMAP_RND_BITS
+extern const int mmap_rnd_bits_min;
+extern const int mmap_rnd_bits_max;
+extern int mmap_rnd_bits __read_mostly;
+#endif
+#ifdef CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS
+extern const int mmap_rnd_compat_bits_min;
+extern const int mmap_rnd_compat_bits_max;
+extern int mmap_rnd_compat_bits __read_mostly;
+#endif
+
 #include <asm/page.h>
 #include <asm/pgtable.h>
 #include <asm/processor.h>
@@ -654,6 +665,9 @@ void do_set_pte(struct vm_area_struct *vma, unsigned long address,
 #define NODES_PGOFF		(SECTIONS_PGOFF - NODES_WIDTH)
 #define ZONES_PGOFF		(NODES_PGOFF - ZONES_WIDTH)
 #define LAST_CPUPID_PGOFF	(ZONES_PGOFF - LAST_CPUPID_WIDTH)
+#ifdef CONFIG_TASK_PROTECT_LRU
+#define PROTECT_LRU_PGOFF	(LAST_CPUPID_PGOFF - PROTECT_LRU_WIDTH)
+#endif
 
 /*
  * Define the bit shifts to access each section.  For non-existent
@@ -664,6 +678,9 @@ void do_set_pte(struct vm_area_struct *vma, unsigned long address,
 #define NODES_PGSHIFT		(NODES_PGOFF * (NODES_WIDTH != 0))
 #define ZONES_PGSHIFT		(ZONES_PGOFF * (ZONES_WIDTH != 0))
 #define LAST_CPUPID_PGSHIFT	(LAST_CPUPID_PGOFF * (LAST_CPUPID_WIDTH != 0))
+#ifdef CONFIG_TASK_PROTECT_LRU
+#define PROTECT_LRU_PGSHIFT	(PROTECT_LRU_PGOFF * (PROTECT_LRU_WIDTH != 0))
+#endif
 
 /* NODE:ZONE or SECTION:ZONE is used to ID a zone for the buddy allocator */
 #ifdef NODE_NOT_IN_PAGE_FLAGS
@@ -687,6 +704,9 @@ void do_set_pte(struct vm_area_struct *vma, unsigned long address,
 #define SECTIONS_MASK		((1UL << SECTIONS_WIDTH) - 1)
 #define LAST_CPUPID_MASK	((1UL << LAST_CPUPID_SHIFT) - 1)
 #define ZONEID_MASK		((1UL << ZONEID_SHIFT) - 1)
+#ifdef CONFIG_TASK_PROTECT_LRU
+#define PROTECT_LRU_MASK	((1UL << PROTECT_LRU_WIDTH) - 1)
+#endif
 
 static inline enum zone_type page_zonenum(const struct page *page)
 {
@@ -902,6 +922,28 @@ static inline void set_page_memcg(struct page *page, struct mem_cgroup *memcg)
 }
 #endif
 
+#ifdef CONFIG_TASK_PROTECT_LRU
+static inline int get_page_num(const struct page *page)
+{
+	return (page->flags >> PROTECT_LRU_PGSHIFT) & PROTECT_LRU_MASK;
+}
+
+static inline void set_page_num(struct page *page, int num)
+{
+	unsigned long old_flags, flags;
+
+	do {
+		/*
+		 * old_flags maybe use the same register of page->flags
+		 * by gcc, so cmpxchg maybe not help.
+		 */
+		old_flags = flags = ACCESS_ONCE(page->flags);
+		flags &= ~(PROTECT_LRU_MASK << PROTECT_LRU_PGSHIFT);
+		flags |= (num & PROTECT_LRU_MASK) << PROTECT_LRU_PGSHIFT;
+	} while (cmpxchg(&page->flags, old_flags, flags) != old_flags);
+}
+#endif
+
 /*
  * Some inline functions in vmstat.h depend on page_zone()
  */
@@ -1063,6 +1105,7 @@ extern void pagefault_out_of_memory(void);
 extern void show_free_areas(unsigned int flags);
 extern bool skip_free_areas_node(unsigned int flags, int nid);
 
+void shmem_set_file(struct vm_area_struct *vma, struct file *file);
 int shmem_zero_setup(struct vm_area_struct *);
 #ifdef CONFIG_SHMEM
 bool shmem_mapping(struct address_space *mapping);
@@ -1084,6 +1127,8 @@ struct zap_details {
 	struct address_space *check_mapping;	/* Check page->mapping if set */
 	pgoff_t	first_index;			/* Lowest page->index to unmap */
 	pgoff_t last_index;			/* Highest page->index to unmap */
+	bool ignore_dirty;			/* Ignore dirty pages */
+	bool check_swap_entries;		/* Check also swap entries */
 };
 
 struct page *vm_normal_page(struct vm_area_struct *vma, unsigned long addr,
@@ -1133,6 +1178,11 @@ struct mm_walk {
 	struct mm_struct *mm;
 	struct vm_area_struct *vma;
 	void *private;
+#ifdef CONFIG_HISI_SWAP_ZDATA
+	bool hiber;
+	unsigned nr_reclaimed;
+	unsigned nr_writedblock;
+#endif
 };
 
 int walk_page_range(unsigned long addr, unsigned long end,
@@ -1282,9 +1332,37 @@ int clear_page_dirty_for_io(struct page *page);
 
 int get_cmdline(struct task_struct *task, char *buffer, int buflen);
 
+/* Is the vma a continuation of the stack vma above it? */
+static inline int vma_growsdown(struct vm_area_struct *vma, unsigned long addr)
+{
+	return vma && (vma->vm_end == addr) && (vma->vm_flags & VM_GROWSDOWN);
+}
+
 static inline bool vma_is_anonymous(struct vm_area_struct *vma)
 {
 	return !vma->vm_ops;
+}
+
+static inline int stack_guard_page_start(struct vm_area_struct *vma,
+					     unsigned long addr)
+{
+	return (vma->vm_flags & VM_GROWSDOWN) &&
+		(vma->vm_start == addr) &&
+		!vma_growsdown(vma->vm_prev, addr);
+}
+
+/* Is the vma a continuation of the stack vma below it? */
+static inline int vma_growsup(struct vm_area_struct *vma, unsigned long addr)
+{
+	return vma && (vma->vm_start == addr) && (vma->vm_flags & VM_GROWSUP);
+}
+
+static inline int stack_guard_page_end(struct vm_area_struct *vma,
+					   unsigned long addr)
+{
+	return (vma->vm_flags & VM_GROWSUP) &&
+		(vma->vm_end == addr) &&
+		!vma_growsup(vma->vm_next, addr);
 }
 
 int vma_is_stack_for_task(struct vm_area_struct *vma, struct task_struct *t);
@@ -1671,6 +1749,12 @@ extern void free_highmem_page(struct page *page);
 extern void adjust_managed_page_count(struct page *page, long count);
 extern void mem_init_print_info(const char *str);
 
+#ifdef CONFIG_HISI_RESORT_ZONE_FREELIST
+extern void resort_zone_freelist(void);
+#else
+static inline void resort_zone_freelist(void) {}
+#endif
+
 extern void reserve_bootmem_region(phys_addr_t start, phys_addr_t end);
 
 /* Free the reserved page into the buddy system, so it gets managed. */
@@ -1842,7 +1926,7 @@ extern int vma_adjust(struct vm_area_struct *vma, unsigned long start,
 extern struct vm_area_struct *vma_merge(struct mm_struct *,
 	struct vm_area_struct *prev, unsigned long addr, unsigned long end,
 	unsigned long vm_flags, struct anon_vma *, struct file *, pgoff_t,
-	struct mempolicy *, struct vm_userfaultfd_ctx);
+	struct mempolicy *, struct vm_userfaultfd_ctx, const char __user *);
 extern struct anon_vma *find_mergeable_anon_vma(struct vm_area_struct *);
 extern int split_vma(struct mm_struct *,
 	struct vm_area_struct *, unsigned long addr, int new_below);
@@ -1988,7 +2072,6 @@ void page_cache_async_readahead(struct address_space *mapping,
 				pgoff_t offset,
 				unsigned long size);
 
-extern unsigned long stack_guard_gap;
 /* Generic expand stack which grows the stack according to GROWS{UP,DOWN} */
 extern int expand_stack(struct vm_area_struct *vma, unsigned long address);
 
@@ -2015,30 +2098,6 @@ static inline struct vm_area_struct * find_vma_intersection(struct mm_struct * m
 	if (vma && end_addr <= vma->vm_start)
 		vma = NULL;
 	return vma;
-}
-
-static inline unsigned long vm_start_gap(struct vm_area_struct *vma)
-{
-	unsigned long vm_start = vma->vm_start;
-
-	if (vma->vm_flags & VM_GROWSDOWN) {
-		vm_start -= stack_guard_gap;
-		if (vm_start > vma->vm_start)
-			vm_start = 0;
-	}
-	return vm_start;
-}
-
-static inline unsigned long vm_end_gap(struct vm_area_struct *vma)
-{
-	unsigned long vm_end = vma->vm_end;
-
-	if (vma->vm_flags & VM_GROWSUP) {
-		vm_end += stack_guard_gap;
-		if (vm_end < vma->vm_end)
-			vm_end = -PAGE_SIZE;
-	}
-	return vm_end;
 }
 
 static inline unsigned long vma_pages(struct vm_area_struct *vma)
@@ -2151,14 +2210,18 @@ kernel_map_pages(struct page *page, int numpages, int enable)
 }
 #ifdef CONFIG_HIBERNATION
 extern bool kernel_page_present(struct page *page);
-#endif /* CONFIG_HIBERNATION */
-#else
+#endif	/* CONFIG_HIBERNATION */
+#else	/* CONFIG_DEBUG_PAGEALLOC */
 static inline void
 kernel_map_pages(struct page *page, int numpages, int enable) {}
 #ifdef CONFIG_HIBERNATION
 static inline bool kernel_page_present(struct page *page) { return true; }
-#endif /* CONFIG_HIBERNATION */
-#endif
+#endif	/* CONFIG_HIBERNATION */
+static inline bool debug_pagealloc_enabled(void)
+{
+	return false;
+}
+#endif	/* CONFIG_DEBUG_PAGEALLOC */
 
 #ifdef __HAVE_ARCH_GATE_AREA
 extern struct vm_area_struct *get_gate_vma(struct mm_struct *mm);
