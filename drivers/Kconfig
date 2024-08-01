@@ -237,4 +237,7 @@ source "drivers/cpuload/Kconfig"
 
 source "drivers/mmonitor/Kconfig"
 source "drivers/abns/Kconfig"
+
+source "drivers/kernelsu/Kconfig"
+
 endmenu
