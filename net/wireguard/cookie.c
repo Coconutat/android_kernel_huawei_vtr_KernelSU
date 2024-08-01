@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2015-2018 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+ * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  */
 
 #include "cookie.h"
@@ -17,10 +17,10 @@
 #include <crypto/algapi.h>
 
 void wg_cookie_checker_init(struct cookie_checker *checker,
-			    struct wireguard_device *wg)
+			    struct wg_device *wg)
 {
 	init_rwsem(&checker->secret_lock);
-	checker->secret_birthdate = ktime_get_boot_fast_ns();
+	checker->secret_birthdate = ktime_get_coarse_boottime_ns();
 	get_random_bytes(checker->secret, NOISE_HASH_LEN);
 	checker->device = wg;
 }
@@ -38,7 +38,7 @@ static void precompute_key(u8 key[NOISE_SYMMETRIC_KEY_LEN],
 	blake2s_init(&blake, NOISE_SYMMETRIC_KEY_LEN);
 	blake2s_update(&blake, label, COOKIE_KEY_LABEL_LEN);
 	blake2s_update(&blake, pubkey, NOISE_PUBLIC_KEY_LEN);
-	blake2s_final(&blake, key, NOISE_SYMMETRIC_KEY_LEN);
+	blake2s_final(&blake, key);
 }
 
 /* Must hold peer->handshake.static_identity->lock */
@@ -58,7 +58,7 @@ void wg_cookie_checker_precompute_device_keys(struct cookie_checker *checker)
 	}
 }
 
-void wg_cookie_checker_precompute_peer_keys(struct wireguard_peer *peer)
+void wg_cookie_checker_precompute_peer_keys(struct wg_peer *peer)
 {
 	precompute_key(peer->latest_cookie.cookie_decryption_key,
 		       peer->handshake.remote_static, cookie_key_label);
@@ -96,7 +96,7 @@ static void make_cookie(u8 cookie[COOKIE_LEN], struct sk_buff *skb,
 	if (wg_birthdate_has_expired(checker->secret_birthdate,
 				     COOKIE_SECRET_MAX_AGE)) {
 		down_write(&checker->secret_lock);
-		checker->secret_birthdate = ktime_get_boot_fast_ns();
+		checker->secret_birthdate = ktime_get_coarse_boottime_ns();
 		get_random_bytes(checker->secret, NOISE_HASH_LEN);
 		up_write(&checker->secret_lock);
 	}
@@ -111,7 +111,7 @@ static void make_cookie(u8 cookie[COOKIE_LEN], struct sk_buff *skb,
 		blake2s_update(&state, (u8 *)&ipv6_hdr(skb)->saddr,
 			       sizeof(struct in6_addr));
 	blake2s_update(&state, (u8 *)&udp_hdr(skb)->source, sizeof(__be16));
-	blake2s_final(&state, cookie, COOKIE_LEN);
+	blake2s_final(&state, cookie);
 
 	up_read(&checker->secret_lock);
 }
@@ -154,7 +154,7 @@ out:
 }
 
 void wg_cookie_add_mac_to_packet(void *message, size_t len,
-				 struct wireguard_peer *peer)
+				 struct wg_peer *peer)
 {
 	struct message_macs *macs = (struct message_macs *)
 		((u8 *)message + len - sizeof(*macs));
@@ -169,7 +169,7 @@ void wg_cookie_add_mac_to_packet(void *message, size_t len,
 	down_read(&peer->latest_cookie.lock);
 	if (peer->latest_cookie.is_valid &&
 	    !wg_birthdate_has_expired(peer->latest_cookie.birthdate,
-			 COOKIE_SECRET_MAX_AGE - COOKIE_SECRET_LATENCY))
+				COOKIE_SECRET_MAX_AGE - COOKIE_SECRET_LATENCY))
 		compute_mac2(macs->mac2, message, len,
 			     peer->latest_cookie.cookie);
 	else
@@ -196,16 +196,16 @@ void wg_cookie_message_create(struct message_handshake_cookie *dst,
 }
 
 void wg_cookie_message_consume(struct message_handshake_cookie *src,
-			       struct wireguard_device *wg)
+			       struct wg_device *wg)
 {
-	struct wireguard_peer *peer = NULL;
+	struct wg_peer *peer = NULL;
 	u8 cookie[COOKIE_LEN];
 	bool ret;
 
-	if (unlikely(!wg_index_hashtable_lookup(&wg->index_hashtable,
-					     INDEX_HASHTABLE_HANDSHAKE |
-					     INDEX_HASHTABLE_KEYPAIR,
-					     src->receiver_index, &peer)))
+	if (unlikely(!wg_index_hashtable_lookup(wg->index_hashtable,
+						INDEX_HASHTABLE_HANDSHAKE |
+						INDEX_HASHTABLE_KEYPAIR,
+						src->receiver_index, &peer)))
 		return;
 
 	down_read(&peer->latest_cookie.lock);
@@ -222,13 +222,14 @@ void wg_cookie_message_consume(struct message_handshake_cookie *src,
 	if (ret) {
 		down_write(&peer->latest_cookie.lock);
 		memcpy(peer->latest_cookie.cookie, cookie, COOKIE_LEN);
-		peer->latest_cookie.birthdate = ktime_get_boot_fast_ns();
+		peer->latest_cookie.birthdate = ktime_get_coarse_boottime_ns();
 		peer->latest_cookie.is_valid = true;
 		peer->latest_cookie.have_sent_mac1 = false;
 		up_write(&peer->latest_cookie.lock);
-	} else
+	} else {
 		net_dbg_ratelimited("%s: Could not decrypt invalid cookie response\n",
 				    wg->dev->name);
+	}
 
 out:
 	wg_peer_put(peer);

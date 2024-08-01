@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
 /*
- * Copyright (C) 2015-2018 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+ * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  */
 
 #include <asm/hwcap.h>
@@ -21,7 +21,7 @@ static bool *const chacha20_nobs[] __initconst = { &chacha20_use_neon };
 static void __init chacha20_fpu_init(void)
 {
 #if defined(CONFIG_ZINC_ARCH_ARM64)
-	chacha20_use_neon = elf_hwcap & HWCAP_ASIMD;
+	chacha20_use_neon = cpu_have_named_feature(ASIMD);
 #elif defined(CONFIG_ZINC_ARCH_ARM)
 	switch (read_cpuid_part()) {
 	case ARM_CPU_PART_CORTEX_A7:

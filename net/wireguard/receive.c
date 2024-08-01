@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2015-2018 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+ * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  */
 
 #include "queueing.h"
@@ -18,7 +18,7 @@
 #include <net/ip_tunnels.h>
 
 /* Must be called with bh disabled. */
-static void rx_stats(struct wireguard_peer *peer, size_t len)
+static void update_rx_stats(struct wg_peer *peer, size_t len)
 {
 	struct pcpu_sw_netstats *tstats =
 		get_cpu_ptr(peer->device->dev->tstats);
@@ -52,12 +52,12 @@ static size_t validate_header_len(struct sk_buff *skb)
 	return 0;
 }
 
-static int skb_prepare_header(struct sk_buff *skb, struct wireguard_device *wg)
+static int prepare_skb_header(struct sk_buff *skb, struct wg_device *wg)
 {
 	size_t data_offset, data_len, header_len;
 	struct udphdr *udp;
 
-	if (unlikely(wg_skb_examine_untrusted_ip_hdr(skb) != skb->protocol ||
+	if (unlikely(!wg_check_packet_protocol(skb) ||
 		     skb_transport_header(skb) < skb->head ||
 		     (skb_transport_header(skb) + sizeof(struct udphdr)) >
 			     skb_tail_pointer(skb)))
@@ -85,7 +85,7 @@ static int skb_prepare_header(struct sk_buff *skb, struct wireguard_device *wg)
 		return -EINVAL;
 	skb_pull(skb, data_offset);
 	if (unlikely(skb->len != data_len))
-		 /* Final len does not agree with calculated len */
+		/* Final len does not agree with calculated len */
 		return -EINVAL;
 	header_len = validate_header_len(skb);
 	if (unlikely(!header_len))
@@ -97,13 +97,13 @@ static int skb_prepare_header(struct sk_buff *skb, struct wireguard_device *wg)
 	return 0;
 }
 
-static void receive_handshake_packet(struct wireguard_device *wg,
-				     struct sk_buff *skb)
+static void wg_receive_handshake_packet(struct wg_device *wg,
+					struct sk_buff *skb)
 {
-	struct wireguard_peer *peer = NULL;
 	enum cookie_mac_state mac_state;
-	/* This is global, so that our load calculation applies to
-	 * the whole system.
+	struct wg_peer *peer = NULL;
+	/* This is global, so that our load calculation applies to the whole
+	 * system. We don't care about races with it at all.
 	 */
 	static u64 last_under_load;
 	bool packet_needs_cookie;
@@ -117,20 +117,23 @@ static void receive_handshake_packet(struct wireguard_device *wg,
 		return;
 	}
 
-	under_load = skb_queue_len(&wg->incoming_handshakes) >=
-		     MAX_QUEUED_INCOMING_HANDSHAKES / 8;
-	if (under_load)
-		last_under_load = ktime_get_boot_fast_ns();
-	else if (last_under_load)
+	under_load = atomic_read(&wg->handshake_queue_len) >=
+			MAX_QUEUED_INCOMING_HANDSHAKES / 8;
+	if (under_load) {
+		last_under_load = ktime_get_coarse_boottime_ns();
+	} else if (last_under_load) {
 		under_load = !wg_birthdate_has_expired(last_under_load, 1);
+		if (!under_load)
+			last_under_load = 0;
+	}
 	mac_state = wg_cookie_validate_packet(&wg->cookie_checker, skb,
 					      under_load);
 	if ((under_load && mac_state == VALID_MAC_WITH_COOKIE) ||
-	    (!under_load && mac_state == VALID_MAC_BUT_NO_COOKIE))
+	    (!under_load && mac_state == VALID_MAC_BUT_NO_COOKIE)) {
 		packet_needs_cookie = false;
-	else if (under_load && mac_state == VALID_MAC_BUT_NO_COOKIE)
+	} else if (under_load && mac_state == VALID_MAC_BUT_NO_COOKIE) {
 		packet_needs_cookie = true;
-	else {
+	} else {
 		net_dbg_skb_ratelimited("%s: Invalid MAC of handshake, dropping packet from %pISpfsc\n",
 					wg->dev->name, skb);
 		return;
@@ -179,7 +182,7 @@ static void receive_handshake_packet(struct wireguard_device *wg,
 				    wg->dev->name, peer->internal_id,
 				    &peer->endpoint.addr);
 		if (wg_noise_handshake_begin_session(&peer->handshake,
-						  &peer->keypairs)) {
+						     &peer->keypairs)) {
 			wg_timers_session_derived(peer);
 			wg_timers_handshake_complete(peer);
 			/* Calling this function will either send any existing
@@ -200,7 +203,7 @@ static void receive_handshake_packet(struct wireguard_device *wg,
 	}
 
 	local_bh_disable();
-	rx_stats(peer, skb->len);
+	update_rx_stats(peer, skb->len);
 	local_bh_enable();
 
 	wg_timers_any_authenticated_packet_received(peer);
@@ -210,41 +213,41 @@ static void receive_handshake_packet(struct wireguard_device *wg,
 
 void wg_packet_handshake_receive_worker(struct work_struct *work)
 {
-	struct wireguard_device *wg =
-		container_of(work, struct multicore_worker, work)->ptr;
+	struct crypt_queue *queue = container_of(work, struct multicore_worker, work)->ptr;
+	struct wg_device *wg = container_of(queue, struct wg_device, handshake_queue);
 	struct sk_buff *skb;
 
-	while ((skb = skb_dequeue(&wg->incoming_handshakes)) != NULL) {
-		receive_handshake_packet(wg, skb);
+	while ((skb = ptr_ring_consume_bh(&queue->ring)) != NULL) {
+		wg_receive_handshake_packet(wg, skb);
 		dev_kfree_skb(skb);
+		atomic_dec(&wg->handshake_queue_len);
 		cond_resched();
 	}
 }
 
-static void keep_key_fresh(struct wireguard_peer *peer)
+static void keep_key_fresh(struct wg_peer *peer)
 {
 	struct noise_keypair *keypair;
-	bool send = false;
+	bool send;
 
 	if (peer->sent_lastminute_handshake)
 		return;
 
 	rcu_read_lock_bh();
 	keypair = rcu_dereference_bh(peer->keypairs.current_keypair);
-	if (likely(keypair && keypair->sending.is_valid) &&
-	    keypair->i_am_the_initiator &&
-	    unlikely(wg_birthdate_has_expired(keypair->sending.birthdate,
-			REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT)))
-		send = true;
+	send = keypair && READ_ONCE(keypair->sending.is_valid) &&
+	       keypair->i_am_the_initiator &&
+	       wg_birthdate_has_expired(keypair->sending.birthdate,
+			REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT);
 	rcu_read_unlock_bh();
 
-	if (send) {
+	if (unlikely(send)) {
 		peer->sent_lastminute_handshake = true;
 		wg_packet_send_queued_handshake_initiation(peer, false);
 	}
 }
 
-static bool decrypt_packet(struct sk_buff *skb, struct noise_symmetric_key *key,
+static bool decrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair,
 			   simd_context_t *simd_context)
 {
 	struct scatterlist sg[MAX_SKB_FRAGS + 8];
@@ -252,13 +255,13 @@ static bool decrypt_packet(struct sk_buff *skb, struct noise_symmetric_key *key,
 	unsigned int offset;
 	int num_frags;
 
-	if (unlikely(!key))
+	if (unlikely(!keypair))
 		return false;
 
-	if (unlikely(!key->is_valid ||
-		  wg_birthdate_has_expired(key->birthdate, REJECT_AFTER_TIME) ||
-		  key->counter.receive.counter >= REJECT_AFTER_MESSAGES)) {
-		key->is_valid = false;
+	if (unlikely(!READ_ONCE(keypair->receiving.is_valid) ||
+		  wg_birthdate_has_expired(keypair->receiving.birthdate, REJECT_AFTER_TIME) ||
+		  keypair->receiving_counter.counter >= REJECT_AFTER_MESSAGES)) {
+		WRITE_ONCE(keypair->receiving.is_valid, false);
 		return false;
 	}
 
@@ -281,9 +284,10 @@ static bool decrypt_packet(struct sk_buff *skb, struct noise_symmetric_key *key,
 	if (skb_to_sgvec(skb, sg, 0, skb->len) <= 0)
 		return false;
 
-	if (!chacha20poly1305_decrypt_sg(sg, sg, skb->len, NULL, 0,
-					 PACKET_CB(skb)->nonce, key->key,
-					 simd_context))
+	if (!chacha20poly1305_decrypt_sg_inplace(sg, skb->len, NULL, 0,
+						 PACKET_CB(skb)->nonce,
+						 keypair->receiving.key,
+						 simd_context))
 		return false;
 
 	/* Another ugly situation of pushing and pulling the header so as to
@@ -298,52 +302,53 @@ static bool decrypt_packet(struct sk_buff *skb, struct noise_symmetric_key *key,
 }
 
 /* This is RFC6479, a replay detection bitmap algorithm that avoids bitshifts */
-static bool counter_validate(union noise_counter *counter, u64 their_counter)
+static bool counter_validate(struct noise_replay_counter *counter, u64 their_counter)
 {
 	unsigned long index, index_current, top, i;
 	bool ret = false;
 
-	spin_lock_bh(&counter->receive.lock);
+	spin_lock_bh(&counter->lock);
 
-	if (unlikely(counter->receive.counter >= REJECT_AFTER_MESSAGES + 1 ||
+	if (unlikely(counter->counter >= REJECT_AFTER_MESSAGES + 1 ||
 		     their_counter >= REJECT_AFTER_MESSAGES))
 		goto out;
 
 	++their_counter;
 
 	if (unlikely((COUNTER_WINDOW_SIZE + their_counter) <
-		     counter->receive.counter))
+		     counter->counter))
 		goto out;
 
 	index = their_counter >> ilog2(BITS_PER_LONG);
 
-	if (likely(their_counter > counter->receive.counter)) {
-		index_current = counter->receive.counter >> ilog2(BITS_PER_LONG);
+	if (likely(their_counter > counter->counter)) {
+		index_current = counter->counter >> ilog2(BITS_PER_LONG);
 		top = min_t(unsigned long, index - index_current,
 			    COUNTER_BITS_TOTAL / BITS_PER_LONG);
 		for (i = 1; i <= top; ++i)
-			counter->receive.backtrack[(i + index_current) &
+			counter->backtrack[(i + index_current) &
 				((COUNTER_BITS_TOTAL / BITS_PER_LONG) - 1)] = 0;
-		counter->receive.counter = their_counter;
+		counter->counter = their_counter;
 	}
 
 	index &= (COUNTER_BITS_TOTAL / BITS_PER_LONG) - 1;
 	ret = !test_and_set_bit(their_counter & (BITS_PER_LONG - 1),
-				&counter->receive.backtrack[index]);
+				&counter->backtrack[index]);
 
 out:
-	spin_unlock_bh(&counter->receive.lock);
+	spin_unlock_bh(&counter->lock);
 	return ret;
 }
+
 #include "selftest/counter.c"
 
-static void packet_consume_data_done(struct wireguard_peer *peer,
-				     struct sk_buff *skb,
-				     struct endpoint *endpoint)
+static void wg_packet_consume_data_done(struct wg_peer *peer,
+					struct sk_buff *skb,
+					struct endpoint *endpoint)
 {
 	struct net_device *dev = peer->device->dev;
-	struct wireguard_peer *routed_peer;
 	unsigned int len, len_before_trim;
+	struct wg_peer *routed_peer;
 
 	wg_socket_set_peer_endpoint(peer, endpoint);
 
@@ -360,7 +365,7 @@ static void packet_consume_data_done(struct wireguard_peer *peer,
 
 	/* A packet with length 0 is a keepalive packet */
 	if (unlikely(!skb->len)) {
-		rx_stats(peer, message_data_len(0));
+		update_rx_stats(peer, message_data_len(0));
 		net_dbg_ratelimited("%s: Receiving keepalive packet from peer %llu (%pISpfsc)\n",
 				    dev->name, peer->internal_id,
 				    &peer->endpoint.addr);
@@ -378,21 +383,29 @@ static void packet_consume_data_done(struct wireguard_peer *peer,
 		goto dishonest_packet_type;
 
 	skb->dev = dev;
+	/* We've already verified the Poly1305 auth tag, which means this packet
+	 * was not modified in transit. We can therefore tell the networking
+	 * stack that all checksums of every layer of encapsulation have already
+	 * been checked "by the hardware" and therefore is unnecessary to check
+	 * again in software.
+	 */
 	skb->ip_summed = CHECKSUM_UNNECESSARY;
-	skb->protocol = wg_skb_examine_untrusted_ip_hdr(skb);
+#ifndef COMPAT_CANNOT_USE_CSUM_LEVEL
+	skb->csum_level = ~0; /* All levels */
+#endif
+	skb->protocol = ip_tunnel_parse_protocol(skb);
 	if (skb->protocol == htons(ETH_P_IP)) {
 		len = ntohs(ip_hdr(skb)->tot_len);
 		if (unlikely(len < sizeof(struct iphdr)))
 			goto dishonest_packet_size;
-		if (INET_ECN_is_ce(PACKET_CB(skb)->ds))
-			IP_ECN_set_ce(ip_hdr(skb));
+		INET_ECN_decapsulate(skb, PACKET_CB(skb)->ds, ip_hdr(skb)->tos);
 	} else if (skb->protocol == htons(ETH_P_IPV6)) {
 		len = ntohs(ipv6_hdr(skb)->payload_len) +
 		      sizeof(struct ipv6hdr);
-		if (INET_ECN_is_ce(PACKET_CB(skb)->ds))
-			IP6_ECN_set_ce(skb, ipv6_hdr(skb));
-	} else
+		INET_ECN_decapsulate(skb, PACKET_CB(skb)->ds, ipv6_get_dsfield(ipv6_hdr(skb)));
+	} else {
 		goto dishonest_packet_type;
+	}
 
 	if (unlikely(len > skb->len))
 		goto dishonest_packet_size;
@@ -407,13 +420,8 @@ static void packet_consume_data_done(struct wireguard_peer *peer,
 	if (unlikely(routed_peer != peer))
 		goto dishonest_packet_peer;
 
-	if (unlikely(napi_gro_receive(&peer->napi, skb) == GRO_DROP)) {
-		++dev->stats.rx_dropped;
-		net_dbg_ratelimited("%s: Failed to give packet to userspace from peer %llu (%pISpfsc)\n",
-				    dev->name, peer->internal_id,
-				    &peer->endpoint.addr);
-	} else
-		rx_stats(peer, message_data_len(len_before_trim));
+	napi_gro_receive(&peer->napi, skb);
+	update_rx_stats(peer, message_data_len(len_before_trim));
 	return;
 
 dishonest_packet_peer:
@@ -441,9 +449,7 @@ packet_processed:
 
 int wg_packet_rx_poll(struct napi_struct *napi, int budget)
 {
-	struct wireguard_peer *peer =
-		container_of(napi, struct wireguard_peer, napi);
-	struct crypt_queue *queue = &peer->rx_queue;
+	struct wg_peer *peer = container_of(napi, struct wg_peer, napi);
 	struct noise_keypair *keypair;
 	struct endpoint endpoint;
 	enum packet_state state;
@@ -454,31 +460,30 @@ int wg_packet_rx_poll(struct napi_struct *napi, int budget)
 	if (unlikely(budget <= 0))
 		return 0;
 
-	while ((skb = __ptr_ring_peek(&queue->ring)) != NULL &&
+	while ((skb = wg_prev_queue_peek(&peer->rx_queue)) != NULL &&
 	       (state = atomic_read_acquire(&PACKET_CB(skb)->state)) !=
 		       PACKET_STATE_UNCRYPTED) {
-		__ptr_ring_discard_one(&queue->ring);
-		peer = PACKET_PEER(skb);
+		wg_prev_queue_drop_peeked(&peer->rx_queue);
 		keypair = PACKET_CB(skb)->keypair;
 		free = true;
 
 		if (unlikely(state != PACKET_STATE_CRYPTED))
 			goto next;
 
-		if (unlikely(!counter_validate(&keypair->receiving.counter,
+		if (unlikely(!counter_validate(&keypair->receiving_counter,
 					       PACKET_CB(skb)->nonce))) {
 			net_dbg_ratelimited("%s: Packet has invalid nonce %llu (max %llu)\n",
 					    peer->device->dev->name,
 					    PACKET_CB(skb)->nonce,
-					    keypair->receiving.counter.receive.counter);
+					    keypair->receiving_counter.counter);
 			goto next;
 		}
 
 		if (unlikely(wg_socket_endpoint_from_skb(&endpoint, skb)))
 			goto next;
 
-		wg_reset_packet(skb);
-		packet_consume_data_done(peer, skb, &endpoint);
+		wg_reset_packet(skb, false);
+		wg_packet_consume_data_done(peer, skb, &endpoint);
 		free = false;
 
 next:
@@ -499,49 +504,45 @@ next:
 
 void wg_packet_decrypt_worker(struct work_struct *work)
 {
-	struct crypt_queue *queue =
-		container_of(work, struct multicore_worker, work)->ptr;
+	struct crypt_queue *queue = container_of(work, struct multicore_worker,
+						 work)->ptr;
 	simd_context_t simd_context;
 	struct sk_buff *skb;
 
 	simd_get(&simd_context);
 	while ((skb = ptr_ring_consume_bh(&queue->ring)) != NULL) {
-		enum packet_state state = likely(decrypt_packet(skb,
-					   &PACKET_CB(skb)->keypair->receiving,
-					   &simd_context)) ?
+		enum packet_state state =
+			likely(decrypt_packet(skb, PACKET_CB(skb)->keypair,
+					      &simd_context)) ?
 				PACKET_STATE_CRYPTED : PACKET_STATE_DEAD;
-		wg_queue_enqueue_per_peer_napi(&PACKET_PEER(skb)->rx_queue, skb,
-					       state);
+		wg_queue_enqueue_per_peer_rx(skb, state);
 		simd_relax(&simd_context);
 	}
 
 	simd_put(&simd_context);
 }
 
-static void wg_packet_consume_data(struct wireguard_device *wg,
-				   struct sk_buff *skb)
+static void wg_packet_consume_data(struct wg_device *wg, struct sk_buff *skb)
 {
 	__le32 idx = ((struct message_data *)skb->data)->key_idx;
-	struct wireguard_peer *peer = NULL;
+	struct wg_peer *peer = NULL;
 	int ret;
 
 	rcu_read_lock_bh();
 	PACKET_CB(skb)->keypair =
 		(struct noise_keypair *)wg_index_hashtable_lookup(
-			&wg->index_hashtable, INDEX_HASHTABLE_KEYPAIR, idx,
+			wg->index_hashtable, INDEX_HASHTABLE_KEYPAIR, idx,
 			&peer);
 	if (unlikely(!wg_noise_keypair_get(PACKET_CB(skb)->keypair)))
 		goto err_keypair;
 
-	if (unlikely(peer->is_dead))
+	if (unlikely(READ_ONCE(peer->is_dead)))
 		goto err;
 
-	ret = wg_queue_enqueue_per_device_and_peer(&wg->decrypt_queue,
-						   &peer->rx_queue, skb,
-						   wg->packet_crypt_wq,
-						   &wg->decrypt_queue.last_cpu);
+	ret = wg_queue_enqueue_per_device_and_peer(&wg->decrypt_queue, &peer->rx_queue, skb,
+						   wg->packet_crypt_wq, &wg->decrypt_queue.last_cpu);
 	if (unlikely(ret == -EPIPE))
-		wg_queue_enqueue_per_peer(&peer->rx_queue, skb, PACKET_STATE_DEAD);
+		wg_queue_enqueue_per_peer_rx(skb, PACKET_STATE_DEAD);
 	if (likely(!ret || ret == -EPIPE)) {
 		rcu_read_unlock_bh();
 		return;
@@ -554,30 +555,36 @@ err_keypair:
 	dev_kfree_skb(skb);
 }
 
-void wg_packet_receive(struct wireguard_device *wg, struct sk_buff *skb)
+void wg_packet_receive(struct wg_device *wg, struct sk_buff *skb)
 {
-	if (unlikely(skb_prepare_header(skb, wg) < 0))
+	if (unlikely(prepare_skb_header(skb, wg) < 0))
 		goto err;
 	switch (SKB_TYPE_LE32(skb)) {
 	case cpu_to_le32(MESSAGE_HANDSHAKE_INITIATION):
 	case cpu_to_le32(MESSAGE_HANDSHAKE_RESPONSE):
 	case cpu_to_le32(MESSAGE_HANDSHAKE_COOKIE): {
-		int cpu;
+		int cpu, ret = -EBUSY;
 
-		if (skb_queue_len(&wg->incoming_handshakes) >
-			    MAX_QUEUED_INCOMING_HANDSHAKES ||
-		    unlikely(!rng_is_initialized())) {
+		if (unlikely(!rng_is_initialized()))
+			goto drop;
+		if (atomic_read(&wg->handshake_queue_len) > MAX_QUEUED_INCOMING_HANDSHAKES / 2) {
+			if (spin_trylock_bh(&wg->handshake_queue.ring.producer_lock)) {
+				ret = __ptr_ring_produce(&wg->handshake_queue.ring, skb);
+				spin_unlock_bh(&wg->handshake_queue.ring.producer_lock);
+			}
+		} else
+			ret = ptr_ring_produce_bh(&wg->handshake_queue.ring, skb);
+		if (ret) {
+	drop:
 			net_dbg_skb_ratelimited("%s: Dropping handshake packet from %pISpfsc\n",
 						wg->dev->name, skb);
 			goto err;
 		}
-		skb_queue_tail(&wg->incoming_handshakes, skb);
-		/* Queues up a call to packet_process_queued_handshake_
-		 * packets(skb):
-		 */
-		cpu = wg_cpumask_next_online(&wg->incoming_handshake_cpu);
+		atomic_inc(&wg->handshake_queue_len);
+		cpu = wg_cpumask_next_online(&wg->handshake_queue.last_cpu);
+		/* Queues up a call to packet_process_queued_handshake_packets(skb): */
 		queue_work_on(cpu, wg->handshake_receive_wq,
-			&per_cpu_ptr(wg->incoming_handshakes_worker, cpu)->work);
+			      &per_cpu_ptr(wg->handshake_queue.worker, cpu)->work);
 		break;
 	}
 	case cpu_to_le32(MESSAGE_DATA):
@@ -585,8 +592,7 @@ void wg_packet_receive(struct wireguard_device *wg, struct sk_buff *skb)
 		wg_packet_consume_data(wg, skb);
 		break;
 	default:
-		net_dbg_skb_ratelimited("%s: Invalid packet from %pISpfsc\n",
-					wg->dev->name, skb);
+		WARN(1, "Non-exhaustive parsing of packet header lead to unknown packet type!\n");
 		goto err;
 	}
 	return;

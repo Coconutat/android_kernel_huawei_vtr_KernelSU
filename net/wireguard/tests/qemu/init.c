@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2015-2018 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+ * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  */
 
 #define _GNU_SOURCE
@@ -18,9 +18,11 @@
 #include <sys/types.h>
 #include <sys/io.h>
 #include <sys/ioctl.h>
+#include <sys/random.h>
 #include <sys/reboot.h>
 #include <sys/utsname.h>
 #include <sys/sendfile.h>
+#include <sys/sysmacros.h>
 #include <linux/random.h>
 #include <linux/version.h>
 
@@ -56,25 +58,17 @@ static void print_banner(void)
 
 static void seed_rng(void)
 {
-	int fd;
-	struct {
-		int entropy_count;
-		int buffer_size;
-		unsigned char buffer[256];
-	} entropy = {
-		.entropy_count = sizeof(entropy.buffer) * 8,
-		.buffer_size = sizeof(entropy.buffer),
-		.buffer = "Adding real entropy is not actually important for these tests. Don't try this at home, kids!"
-	};
+	int bits = 4096, fd;
 
-	if (mknod("/dev/urandom", S_IFCHR | 0644, makedev(1, 9)))
-		panic("mknod(/dev/urandom)");
-	fd = open("/dev/urandom", O_WRONLY);
+	pretty_message("[+] Fake seeding RNG...");
+	fd = open("/dev/random", O_WRONLY);
 	if (fd < 0)
-		panic("open(urandom)");
-	for (int i = 0; i < 256; ++i) {
-		if (ioctl(fd, RNDADDENTROPY, &entropy) < 0)
-			panic("ioctl(urandom)");
+		panic("open(random)");
+	for (;;) {
+		if (!getrandom(NULL, 0, GRND_NONBLOCK) || errno == ENOSYS)
+			break;
+		if (ioctl(fd, RNDADDTOENTCNT, &bits) < 0)
+			panic("ioctl(RNDADDTOENTCNT)");
 	}
 	close(fd);
 }
@@ -122,12 +116,6 @@ static void enable_logging(void)
 			panic("write(exception-trace)");
 		close(fd);
 	}
-	fd = open("/proc/sys/kernel/panic_on_warn", O_WRONLY);
-	if (fd >= 0) {
-		if (write(fd, "1\n", 2) != 2)
-			panic("write(panic_on_warn)");
-		close(fd);
-	}
 }
 
 static void kmod_selftests(void)
@@ -158,7 +146,7 @@ static void kmod_selftests(void)
 	}
 	fclose(file);
 	if (!success) {
-		puts("\x1b[31m\x1b[1m[-] Tests failed! :-(\x1b[0m");
+		puts("\x1b[31m\x1b[1m[-] Tests failed! \u2639\x1b[0m");
 		poweroff();
 	}
 }
@@ -203,8 +191,19 @@ static void launch_tests(void)
 		if (write(fd, "success\n", 8) != 8)
 			panic("write(success_dev)");
 		close(fd);
-	} else
-		puts("\x1b[31m\x1b[1m[-] Tests failed! :-(\x1b[0m");
+	} else {
+		const char *why = "unknown cause";
+		int what = -1;
+
+		if (WIFEXITED(status)) {
+			why = "exit code";
+			what = WEXITSTATUS(status);
+		} else if (WIFSIGNALED(status)) {
+			why = "signal";
+			what = WTERMSIG(status);
+		}
+		printf("\x1b[31m\x1b[1m[-] Tests failed with %s %d! \u2639\x1b[0m\n", why, what);
+	}
 }
 
 static void ensure_console(void)
@@ -259,10 +258,10 @@ static void check_leaks(void)
 
 int main(int argc, char *argv[])
 {
-	seed_rng();
 	ensure_console();
 	print_banner();
 	mount_filesystems();
+	seed_rng();
 	kmod_selftests();
 	enable_logging();
 	clear_leaks();

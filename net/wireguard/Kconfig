@@ -4,14 +4,15 @@ config WIREGUARD
 	depends on IPV6 || !IPV6
 	select NET_UDP_TUNNEL
 	select DST_CACHE
-	select CRYPTO_BLKCIPHER
+	select CRYPTO
+	select CRYPTO_ALGAPI
 	select VFP
 	select VFPv3 if CPU_V7
 	select NEON if CPU_V7
 	select KERNEL_MODE_NEON if CPU_V7
 	default y
 	help
-	  WireGuard is a secure, fast, and easy to use replacement for IPSec
+	  WireGuard is a secure, fast, and easy to use replacement for IPsec
 	  that uses modern cryptography and clever networking tricks. It's
 	  designed to be fairly general purpose and abstract enough to fit most
 	  use cases, while at the same time remaining extremely simple to

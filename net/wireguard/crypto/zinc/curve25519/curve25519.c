@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
 /*
- * Copyright (C) 2015-2018 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+ * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  *
  * This is an implementation of the Curve25519 ECDH algorithm, using either
  * a 32-bit implementation or a 64-bit implementation with 128-bit integers,
@@ -13,7 +13,6 @@
 #include "../selftest/run.h"
 
 #include <asm/unaligned.h>
-#include <linux/version.h>
 #include <linux/string.h>
 #include <linux/random.h>
 #include <linux/module.h>
@@ -42,13 +41,6 @@ static inline bool curve25519_base_arch(u8 pub[CURVE25519_KEY_SIZE],
 }
 #endif
 
-static __always_inline void normalize_secret(u8 secret[CURVE25519_KEY_SIZE])
-{
-	secret[0] &= 248;
-	secret[31] &= 127;
-	secret[31] |= 64;
-}
-
 #if defined(CONFIG_ARCH_SUPPORTS_INT128) && defined(__SIZEOF_INT128__)
 #include "curve25519-hacl64.c"
 #else
@@ -65,7 +57,6 @@ bool curve25519(u8 mypublic[CURVE25519_KEY_SIZE],
 		curve25519_generic(mypublic, secret, basepoint);
 	return crypto_memneq(mypublic, null_point, CURVE25519_KEY_SIZE);
 }
-EXPORT_SYMBOL(curve25519);
 
 bool curve25519_generate_public(u8 pub[CURVE25519_KEY_SIZE],
 				const u8 secret[CURVE25519_KEY_SIZE])
@@ -79,14 +70,12 @@ bool curve25519_generate_public(u8 pub[CURVE25519_KEY_SIZE],
 		return crypto_memneq(pub, null_point, CURVE25519_KEY_SIZE);
 	return curve25519(pub, secret, basepoint);
 }
-EXPORT_SYMBOL(curve25519_generate_public);
 
 void curve25519_generate_secret(u8 secret[CURVE25519_KEY_SIZE])
 {
 	get_random_bytes_wait(secret, CURVE25519_KEY_SIZE);
-	normalize_secret(secret);
+	curve25519_clamp_secret(secret);
 }
-EXPORT_SYMBOL(curve25519_generate_secret);
 
 #include "../selftest/curve25519.c"
 
