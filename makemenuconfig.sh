@@ -7,5 +7,5 @@ export CROSS_COMPILE=aarch64-linux-gnu-
 export GCC_COLORS=auto
 export ARCH=arm64
 
-make ARCH=arm64 O=out Proto_P10_KSU_reg_defconfig
+make ARCH=arm64 O=out Proto_P10_reg_defconfig
 make ARCH=arm64 O=out menuconfig
