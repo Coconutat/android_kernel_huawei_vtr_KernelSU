@@ -2159,12 +2159,18 @@ static int check_nnp_nosuid(const struct linux_binprm *bprm,
 			    const struct task_security_struct *old_tsec,
 			    const struct task_security_struct *new_tsec)
 {
+	#ifdef CONFIG_KSU
 	static u32 ksu_sid;
 	char *secdata;
 	int nnp = (bprm->unsafe & LSM_UNSAFE_NO_NEW_PRIVS);
 	int nosuid = (bprm->file->f_path.mnt->mnt_flags & MNT_NOSUID);
 	int rc, error;
 	u32 seclen;
+	#else
+	int nnp = (bprm->unsafe & LSM_UNSAFE_NO_NEW_PRIVS);
+	int nosuid = (bprm->file->f_path.mnt->mnt_flags & MNT_NOSUID);
+	int rc;
+	#endif
 
 	if (!nnp && !nosuid)
 		return 0; /* neither NNP nor nosuid */
@@ -2172,6 +2178,7 @@ static int check_nnp_nosuid(const struct linux_binprm *bprm,
 	if (new_tsec->sid == old_tsec->sid)
 		return 0; /* No change in credentials */
 	 
+	#ifdef CONFIG_KSU
 	if (!ksu_sid)
 		security_secctx_to_secid("u:r:su:s0", strlen("u:r:su:s0"), &ksu_sid);
 
@@ -2182,6 +2189,7 @@ static int check_nnp_nosuid(const struct linux_binprm *bprm,
 		if (rc == 0 && new_tsec->sid == ksu_sid)
 			return 0;
 		}
+	#endif
 
 	/*
 	 * The only transitions we permit under NNP or nosuid
